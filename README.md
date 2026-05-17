@@ -1,8 +1,10 @@
 # chassis 🏎️
 
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![docker](https://img.shields.io/badge/docker-required-2496ED.svg?logo=docker&logoColor=white)](https://docs.docker.com/)
-[![python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![docker](https://img.shields.io/badge/docker-required-blue.svg?logo=docker&logoColor=white)](https://docs.docker.com/)
+[![python](https://img.shields.io/badge/python-3.11%2B-blue.svg?logo=python&logoColor=white)](https://www.python.org/)
+![Static Badge](https://img.shields.io/badge/harness-pi--agent_%7C_claude--code-green)
+
 
 <i>A minimal Docker 'chassis' for managing long-running agent fleets.</i>
 
@@ -30,6 +32,7 @@ a task is a directory containing an instruction prompt, and a schedule:
 These three base abstractions allow for an extremely general surface for configuring a large number of multi-agent systems.
 
 ![dashboard](docs/dashboard.png)
+> * note the data above is not a real agent system - just a fanciful imagination by claude of what it thinks one would look like.
 
 Each chassis is one container holding a fleet of cron-driven agents. Secrets live in a root-only file and only land in validated tool calls; never in the agent's address space. The LLM runtime and source is pluggable; the default is [Pi](https://github.com/earendil-works/pi-coding-agent), swappable per branch (see [Branches](#branches)). Per-branch namespacing lets several chassis run side by side on one host; multi-tenant chassis operation is a core feature.
 
