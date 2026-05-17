@@ -22,6 +22,8 @@ import time
 import uuid
 from pathlib import Path
 
+__version__ = "0.1.0"
+
 REPO = Path(__file__).resolve().parent
 ENV_EXAMPLE = REPO / ".env.example"
 ENV_FILE = REPO / ".env"
@@ -412,6 +414,7 @@ def main() -> int:
         epilog=HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("--version", action="version", version=f"chassis {__version__}")
     sub = p.add_subparsers(
         dest="cmd",
         required=True,
