@@ -69,6 +69,17 @@ Skip the wizard with `chassis run manager`: the manager can scaffold agents from
 - **Audit log.** Every dispatcher call appends to `/var/log/chassis/run-tool.jsonl` with secrets redacted from stdout/stderr.
 - **Dashboard.** [`dashboard/`](dashboard/) auto-discovers running chassis on the host and surfaces cron schedules, last runs, audit tail, and a drill-in for individual sessions.
 
+## Tools
+
+Tools are scripts in `tools/` registered in [`tools/tools.json`](tools/tools.json). The dispatcher validates args against each tool's JSON schema and injects only the declared `.env` secrets into the child process.
+
+| Tool | What it does | Secrets |
+|---|---|---|
+| `web-search` | Tavily web search; returns title/url/content. | `TAVILY_API_KEY` |
+| `web-fetch` | Fetch http(s) URL, optional tag-strip, char-capped. | — |
+
+Add a tool: drop a script in `tools/`, append an entry to `tools.json`, run `chassis reload-cron`. See [`tools/README.md`](tools/README.md) for the full contract.
+
 ## LLM endpoint
 
 Configured in `harness/llm.env` (committed; branch-specific). Point `LLM_BASE_URL` at any OpenAI-compatible endpoint:
@@ -123,7 +134,7 @@ The `chassis` CLI namespaces containers, volumes, and networks by branch. `chass
 ## Testing
 
 ```sh
-./chassis test ping                                # against current config
+./chassis test ping  # against current config
 ./chassis test ping --set LLM_BASE_URL=https://openrouter.ai/api/v1 \
                     --set LLM_API_KEY=sk-or-v1-... \
                     --set LLM_MODEL_ID=anthropic/claude-sonnet-4-5
@@ -143,4 +154,5 @@ Spins up a fully-namespaced throwaway container (own image tag, volumes, network
 ## Security
 
 All agents in one chassis share one Linux user, so any agent can call any registered tool, write tools assuming that. The trust boundary is the dispatcher: secrets live in mode-600 `.env` (root-owned in container), tool implementations live behind mode-700 `/mnt/protected/` (root-only), and the only thing on the agent's passwordless sudo list is `run-tool`. The dashboard is read-only and has no auth, don't expose it on the open internet; use a tailnet ACL or equivalent.
+
 
