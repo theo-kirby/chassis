@@ -1,25 +1,11 @@
 #!/usr/bin/env python3
-"""
-chassis — host CLI.
+"""chassis — host CLI.
 
-Subcommands wrap docker compose / docker exec to drive the container. The
-chassis is named after the current git branch (`chassis/<name>` → `<name>`,
-default `default`); container/volumes/network are namespaced as
-`<name>-chassis*` so multiple chassis can coexist on one host. Override with
-CHASSIS_NAME=<name>.
-
-Usage:
-  ./chassis init                  scaffold .env from .env.example
-  ./chassis up                    docker compose up -d --build
-  ./chassis down                  docker compose down
-  ./chassis setup                 open the onboarding wizard (scaffolds your first agent)
-  ./chassis install [--print]     add a `chassis` shell function to ~/.bashrc or ~/.zshrc
-  ./chassis reload-cron           re-render tools-public.json + /etc/cron.d/chassis (no restart)
-  ./chassis run <agent> [task]    one-shot when task is given; interactive otherwise
-  ./chassis shell [--root]        agent-user shell (or root with --root)
-  ./chassis logs [agent]          tail dispatcher audit log, or per-agent run logs
-  ./chassis status                container state + cron file + recent log activity
-  ./chassis test <name> [--set K=V ...]   spin up an ephemeral container, run harness/tests/<name>, tear down
+Subcommands wrap docker compose / docker exec to drive the container.
+See `./chassis --help` for the command surface; the chassis is named
+after the current git branch (`main` → `default`), namespacing
+container/volumes/network so multiple chassis coexist on one host.
+Override with CHASSIS_NAME=<name>.
 """
 
 from __future__ import annotations
@@ -393,39 +379,67 @@ def cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
+HELP_DESCRIPTION = """\
+chassis — host CLI for a Docker-based agent fleet.
+
+Each chassis is namespaced by the current git branch (override via
+CHASSIS_NAME); `main` becomes `default`, so several chassis can coexist
+on one host.
+"""
+
+HELP_EPILOG = """\
+common workflows:
+  first run        chassis init && chassis up && chassis setup
+  attach manager   chassis run manager
+  after tools/     chassis reload-cron
+  smoke test       chassis test ping
+
+run `chassis <command> --help` for command-specific options.
+"""
+
+
 def main() -> int:
-    p = argparse.ArgumentParser(prog="chassis", description=__doc__)
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p = argparse.ArgumentParser(
+        prog="chassis",
+        description=HELP_DESCRIPTION,
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(
+        dest="cmd",
+        required=True,
+        metavar="<command>",
+        title="commands",
+    )
 
-    sub.add_parser("init",        help="scaffold .env from .env.example").set_defaults(func=cmd_init)
-    sub.add_parser("up",          help="docker compose up -d --build").set_defaults(func=cmd_up)
-    sub.add_parser("down",        help="docker compose down").set_defaults(func=cmd_down)
+    # lifecycle
+    sub.add_parser("init",        help="scaffold .env from .env.example (mode 600)").set_defaults(func=cmd_init)
+    sub.add_parser("up",          help="build + start the chassis container").set_defaults(func=cmd_up)
+    sub.add_parser("down",        help="stop the chassis container").set_defaults(func=cmd_down)
+    sub.add_parser("status",      help="container state + cron file + recent log activity").set_defaults(func=cmd_status)
+
+    # agent interaction
     sub.add_parser("setup",       help="onboarding wizard — scaffolds your first agent").set_defaults(func=cmd_setup)
-    sub.add_parser("reload-cron", help="re-render tools-public.json + cron").set_defaults(func=cmd_reload_cron)
 
-    p_run = sub.add_parser("run", help="interactive if task omitted, one-shot otherwise")
-    p_run.add_argument("agent")
-    p_run.add_argument("task", nargs="?", default=None)
+    p_run = sub.add_parser("run", help="run an agent (interactive if no task, one-shot otherwise)")
+    p_run.add_argument("agent", help="agent name under /home/agent/")
+    p_run.add_argument("task", nargs="?", default=None, help="optional task name for one-shot mode")
     p_run.set_defaults(func=cmd_run)
 
-    p_logs = sub.add_parser("logs", help="tail dispatcher audit log or per-agent run logs")
-    p_logs.add_argument("agent", nargs="?", default=None)
-    p_logs.set_defaults(func=cmd_logs)
-
-    p_shell = sub.add_parser("shell", help="shell in the container (default: agent user)")
+    p_shell = sub.add_parser("shell", help="open a shell in the container (default: agent user)")
     p_shell.add_argument("--root", action="store_true", help="open as root instead of agent")
     p_shell.set_defaults(func=cmd_shell)
 
-    sub.add_parser("status",      help="container + cron + log summary").set_defaults(func=cmd_status)
+    p_logs = sub.add_parser("logs", help="tail dispatcher audit log, or per-agent run logs")
+    p_logs.add_argument("agent", nargs="?", default=None, help="agent name; omit for dispatcher audit log")
+    p_logs.set_defaults(func=cmd_logs)
 
-    p_install = sub.add_parser(
-        "install",
-        help="add a `chassis` shell function to ~/.bashrc or ~/.zshrc",
-    )
-    p_install.add_argument(
-        "--print", action="store_true",
-        help="print the wrapper to stdout instead of editing any rc file",
-    )
+    # maintenance
+    sub.add_parser("reload-cron", help="re-render tools-public.json + cron (no restart)").set_defaults(func=cmd_reload_cron)
+
+    p_install = sub.add_parser("install", help="add a `chassis` shell function to ~/.bashrc or ~/.zshrc")
+    p_install.add_argument("--print", action="store_true",
+                           help="print the wrapper to stdout instead of editing any rc file")
     p_install.set_defaults(func=cmd_install)
 
     p_test = sub.add_parser("test", help="run harness/tests/<name> in an ephemeral container")
