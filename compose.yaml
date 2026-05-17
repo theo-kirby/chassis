@@ -1,0 +1,36 @@
+services:
+  chassis:
+    build: .
+    # CHASSIS_NAME is set by the host CLI (./chassis) from the current
+    # git branch — branch name verbatim, with `main` → "default".
+    image: ${CHASSIS_NAME:-default}-chassis
+    container_name: ${CHASSIS_NAME:-default}-chassis
+    environment:
+      - TZ=${TZ:-UTC}
+    env_file:
+      # Non-secret chassis config (LLM endpoint, model id, etc). Single source
+      # of truth — see harness/llm.env.
+      - ./harness/llm.env
+    volumes:
+      # Secrets bind — entrypoint copies into /etc/chassis/.env (container
+      # writable layer) so chmod side-effects stay in-container.
+      - ./.env:/run/secrets/chassis.env:ro
+      # Hot-editable tool scripts + registry. Parent /mnt/protected is mode 700
+      # root in the image, so the agent cannot traverse into this dir even
+      # though the bind perms are inherited from the host.
+      - ./tools:/mnt/protected/tools:ro
+      # Agent-owned persistent state: agent definitions, .pi sessions, scratch.
+      - agent-home:/home/agent
+      - logs:/var/log/chassis
+    networks: [chassis-net]
+    restart: unless-stopped
+
+volumes:
+  agent-home:
+    name: ${CHASSIS_NAME:-default}-chassis-agent-home
+  logs:
+    name: ${CHASSIS_NAME:-default}-chassis-logs
+
+networks:
+  chassis-net:
+    name: ${CHASSIS_NAME:-default}-chassis-net

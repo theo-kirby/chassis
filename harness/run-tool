@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+run-tool — privileged dispatcher.
+
+Usage:  sudo /usr/local/bin/run-tool <tool> '<json-args>'
+        sudo /usr/local/bin/run-tool --list
+
+Looks up <tool> in /mnt/protected/tools/tools.json (root-only bind from host).
+Validates the JSON args against the tool's args_schema (jsonschema). Loads
+/etc/chassis/.env
+and builds a clean child env containing only the keys listed under the tool's
+`secrets`. Execs the runner script with the JSON args as a single argv element.
+
+Captures stdout/stderr; replaces every .env value with [REDACTED:<KEY>] before
+forwarding to the caller. Substring redaction is best-effort: short values
+risk false positives, and a tool that re-encodes a secret (base64, URL-encode)
+will defeat it. Tools shouldn't echo secrets at all.
+
+Append a JSON line to /var/log/chassis/run-tool.jsonl per call:
+  { ts, tool, args, exit, duration_ms, secrets_passed, status, reason? }
+The args field is captured pre-redaction; if a caller jams a secret into
+args, that is leaked into the audit log. Tools should declare specific
+args_schemas that don't accept secret-shaped strings, and must never echo
+secrets into args.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import jsonschema
+except ImportError:
+    jsonschema = None  # the smoke test runs without the package; tools.json may have no schemas
+
+TOOLS_DIR = Path("/mnt/protected/tools")
+MANIFEST_PATH = TOOLS_DIR / "tools.json"
+ENV_PATH = Path("/etc/chassis/.env")
+AUDIT_LOG = Path("/var/log/chassis/run-tool.jsonl")
+
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_VALIDATION = 2
+
+
+def load_manifest() -> dict:
+    with open(MANIFEST_PATH) as f:
+        return json.load(f)
+
+
+def load_env() -> dict[str, str]:
+    """Parse /etc/chassis/.env into a dict. Missing file is fine — no secrets is valid."""
+    if not ENV_PATH.exists():
+        return {}
+    out: dict[str, str] = {}
+    for line in ENV_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        out[key.strip()] = val.strip().strip('"').strip("'")
+    return out
+
+
+def redact(text: str, secrets: dict[str, str]) -> str:
+    """Replace each non-empty secret value in text with [REDACTED:<KEY>].
+
+    Sort by descending length so a longer secret containing a shorter one is
+    replaced first; otherwise the shorter match would split the longer.
+    """
+    if not text or not secrets:
+        return text
+    items = sorted(
+        ((k, v) for k, v in secrets.items() if v),
+        key=lambda kv: len(kv[1]),
+        reverse=True,
+    )
+    for k, v in items:
+        text = text.replace(v, f"[REDACTED:{k}]")
+    return text
+
+
+def audit(record: dict) -> None:
+    record.setdefault("ts", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    try:
+        AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as e:
+        print(f"run-tool: could not write audit log: {e}", file=sys.stderr)
+
+
+def deny(record: dict, reason: str, exit_code: int = EXIT_VALIDATION) -> int:
+    record["status"] = "denied"
+    record["reason"] = reason
+    record["exit"] = exit_code
+    audit(record)
+    print(f"run-tool: denied — {reason}", file=sys.stderr)
+    return exit_code
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("Usage: sudo /usr/local/bin/run-tool <tool> '<json-args>'", file=sys.stderr)
+        print("       sudo /usr/local/bin/run-tool --list", file=sys.stderr)
+        return EXIT_USAGE
+
+    manifest = load_manifest()
+    tools = {t["name"]: t for t in manifest.get("tools", [])}
+
+    if sys.argv[1] == "--list":
+        for name, info in sorted(tools.items()):
+            print(f"  {name:20s}  {info.get('description', '')}")
+        return EXIT_OK
+
+    tool_name = sys.argv[1]
+    raw_args = sys.argv[2] if len(sys.argv) >= 3 else "{}"
+
+    record: dict = {"tool": tool_name, "args": raw_args}
+
+    if tool_name not in tools:
+        return deny(record, f"unknown tool {tool_name!r}", EXIT_USAGE)
+    tool = tools[tool_name]
+
+    try:
+        args = json.loads(raw_args)
+    except json.JSONDecodeError as e:
+        return deny(record, f"args is not valid JSON: {e}")
+
+    schema = tool.get("args_schema")
+    if schema is not None:
+        if jsonschema is None:
+            return deny(record, "jsonschema library not installed but tool declares args_schema")
+        try:
+            jsonschema.validate(args, schema)
+        except jsonschema.ValidationError as e:
+            return deny(record, f"args_schema violation: {e.message}")
+
+    # Build child env: clean baseline + declared secrets only.
+    secret_keys = tool.get("secrets", []) or []
+    all_env_vals = load_env()
+    secret_values = {k: all_env_vals[k] for k in secret_keys if k in all_env_vals}
+
+    child_env = {
+        "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        "HOME": "/root",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+    }
+    child_env.update(secret_values)
+
+    # Resolve script + runner.
+    script_rel = tool.get("script")
+    if not script_rel:
+        return deny(record, "tool entry missing 'script'")
+    script_path = TOOLS_DIR / script_rel
+    runner = tool.get("runner", "python3")
+    runner_path = shutil.which(runner) or runner
+
+    cmd = [runner_path, str(script_path), raw_args]
+
+    record["secrets_passed"] = sorted(secret_keys)
+    start_mono = time.monotonic()
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(TOOLS_DIR),
+            env=child_env,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:
+        record["status"] = "exec_error"
+        record["reason"] = str(e)
+        record["exit"] = 127
+        record["duration_ms"] = round((time.monotonic() - start_mono) * 1000)
+        audit(record)
+        print(f"run-tool: exec error — {e}", file=sys.stderr)
+        return 127
+
+    stdout = redact(result.stdout, secret_values)
+    stderr = redact(result.stderr, secret_values)
+    sys.stdout.write(stdout)
+    sys.stdout.flush()
+    sys.stderr.write(stderr)
+    sys.stderr.flush()
+
+    record["status"] = "ok" if result.returncode == 0 else "error"
+    record["exit"] = result.returncode
+    record["duration_ms"] = round((time.monotonic() - start_mono) * 1000)
+    audit(record)
+    return result.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

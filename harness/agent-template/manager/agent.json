@@ -1,0 +1,5 @@
+{
+  "tools": [],
+  "claude_defaults": ["Read", "Write", "Edit", "Bash"],
+  "model": ""
+}

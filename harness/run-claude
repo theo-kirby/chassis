@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+#
+# run-claude — drop privileges (when invoked as root) and exec `claude` with
+# the chassis MCP server attached. With a task, runs one-shot via --print
+# using the task's INSTRUCTIONS.md as prompt; without, runs interactive (TUI).
+
+set -euo pipefail
+
+agent="${1:-}"
+task="${2:-}"
+
+if [[ -z "$agent" ]]; then
+    echo "Usage: run-claude <agent> [task]" >&2
+    exit 1
+fi
+
+export CHASSIS_AGENT="$agent"
+export CHASSIS_TASK="$task"
+
+AGENT_DIR="/home/agent/$agent"
+AGENT_JSON="$AGENT_DIR/agent.json"
+SYSTEM_MD="$AGENT_DIR/SYSTEM.md"
+
+if [[ ! -f "$AGENT_JSON" ]]; then
+    echo "run-claude: agent.json not found at $AGENT_JSON" >&2
+    exit 1
+fi
+
+extra=()
+prompt=""
+
+if [[ -n "$task" ]]; then
+    instructions="$AGENT_DIR/$task/INSTRUCTIONS.md"
+    if [[ ! -f "$instructions" ]]; then
+        echo "run-claude: task instructions not found at $instructions" >&2
+        exit 1
+    fi
+    prompt="$(cat "$instructions")"
+    # --print: non-interactive; claude processes the prompt and exits.
+    extra+=(--print)
+fi
+
+# Prepend SYSTEM.md to the assembled system prompt every turn. Empty/missing
+# SYSTEM.md is fine — agents without a custom prompt fall through to Claude's
+# built-in system prompt.
+if [[ -f "$SYSTEM_MD" ]]; then
+    system_md="$(cat "$SYSTEM_MD")"
+    if [[ -n "${system_md//[[:space:]]/}" ]]; then
+        extra+=(--append-system-prompt "$system_md")
+    fi
+fi
+
+# Resolve model: agent.json:model wins; else $CLAUDE_MODEL (from harness/llm.env);
+# else omit the flag and let Claude Code pick its default.
+model="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("model","") or "")' "$AGENT_JSON")"
+if [[ -z "$model" && -n "${CLAUDE_MODEL:-}" ]]; then
+    model="$CLAUDE_MODEL"
+fi
+if [[ -n "$model" ]]; then
+    extra+=(--model "$model")
+fi
+
+# Build the allowed-tools list. claude_defaults are Claude Code's built-in
+# tool names (Read/Write/Edit/Bash/...). Chassis tools are exposed by the MCP
+# server under the mcp__chassis__<name> prefix, so we mirror agent.json:tools
+# into that namespace.
+allowed=()
+defaults_csv="$(python3 -c '
+import json,sys
+d = json.load(open(sys.argv[1]))
+print(",".join(d.get("claude_defaults", []) or []))
+' "$AGENT_JSON")"
+tools_csv="$(python3 -c '
+import json,sys
+d = json.load(open(sys.argv[1]))
+print(",".join(f"mcp__chassis__{t}" for t in (d.get("tools", []) or [])))
+' "$AGENT_JSON")"
+allowed_csv=""
+if [[ -n "$defaults_csv" ]]; then
+    allowed_csv="$defaults_csv"
+fi
+if [[ -n "$tools_csv" ]]; then
+    if [[ -n "$allowed_csv" ]]; then
+        allowed_csv="$allowed_csv,$tools_csv"
+    else
+        allowed_csv="$tools_csv"
+    fi
+fi
+if [[ -n "$allowed_csv" ]]; then
+    extra+=(--allowed-tools "$allowed_csv")
+fi
+
+# MCP server config — stdio launch of the bundled chassis-mcp. CHASSIS_AGENT
+# and CHASSIS_TASK reach the child via the mcp config's env block so the MCP
+# server knows which agent's tool list to expose.
+MCP_CONFIG="/tmp/chassis-mcp-${agent}.json"
+python3 - "$MCP_CONFIG" "$agent" "$task" <<'PY'
+import json, sys
+path, agent, task = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = {
+    "mcpServers": {
+        "chassis": {
+            "command": "node",
+            "args": ["/usr/local/lib/chassis-mcp/index.js"],
+            "env": {
+                "CHASSIS_AGENT": agent,
+                "CHASSIS_TASK":  task,
+            },
+        }
+    }
+}
+json.dump(cfg, open(path, "w"))
+PY
+extra+=(--mcp-config "$MCP_CONFIG")
+
+cmd=(claude "${extra[@]}")
+[[ -n "$prompt" ]] && cmd+=("$prompt")
+
+if [[ $(id -u) -eq 0 ]]; then
+    exec runuser -u agent -- env CHASSIS_AGENT="$agent" CHASSIS_TASK="$task" \
+        CLAUDE_MODEL="${CLAUDE_MODEL:-}" "${cmd[@]}"
+else
+    exec "${cmd[@]}"
+fi

@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""
+ping — fire a one-shot completion at the configured Claude Code runtime.
+
+Runs `claude --print "Reply with the single word: pong"` as the agent user
+and checks the response contains "pong" (case-insensitive). Exits non-zero
+if `claude` is missing, unauthenticated, or returns no content.
+
+Requires `./chassis login` to have been run first — the ephemeral test
+container starts with no credentials. If the login session is missing the
+test fails with a clear message rather than silently passing.
+
+Stdlib only — no extra deps in the test image.
+"""
+import shutil
+import subprocess
+import sys
+
+PROMPT = "Reply with the single word: pong"
+
+
+def main() -> int:
+    if not shutil.which("claude"):
+        print("ping: `claude` not on PATH — image build broken?", file=sys.stderr)
+        return 2
+
+    print(f"prompt   : {PROMPT!r}")
+    try:
+        result = subprocess.run(
+            ["claude", "--print", PROMPT],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        print("ping: `claude --print` timed out after 120s", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"ping: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+    out = (result.stdout or "").strip()
+    err = (result.stderr or "").strip()
+    print(f"exit     : {result.returncode}")
+    print(f"response : {out!r}")
+
+    if result.returncode != 0:
+        if err:
+            print(err, file=sys.stderr)
+        # Most common failure mode in a fresh chassis: no credentials. Surface
+        # the actionable hint rather than just propagating the exit code.
+        if "login" in err.lower() or "auth" in err.lower() or "credential" in err.lower():
+            print("ping: claude is not authenticated — run `./chassis login` first.", file=sys.stderr)
+        return 1
+
+    if not out:
+        print("ping: empty response from claude", file=sys.stderr)
+        return 1
+
+    if "pong" not in out.lower():
+        print("ping: response did not contain 'pong'", file=sys.stderr)
+        return 1
+
+    print("OK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

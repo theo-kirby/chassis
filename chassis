@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""
+chassis — host CLI.
+
+Subcommands wrap docker compose / docker exec to drive the container. The
+chassis is named after the current git branch (`chassis/<name>` → `<name>`,
+default `default`); container/volumes/network are namespaced as
+`<name>-chassis*` so multiple chassis can coexist on one host. Override with
+CHASSIS_NAME=<name>.
+
+Usage:
+  ./chassis init                  scaffold .env from .env.example
+  ./chassis up                    docker compose up -d --build
+  ./chassis down                  docker compose down
+  ./chassis setup                 open the onboarding wizard (scaffolds your first agent)
+  ./chassis login                 interactive Anthropic login (persists on agent-home volume)
+  ./chassis install [--print]     add a `chassis` shell function to ~/.bashrc or ~/.zshrc
+  ./chassis reload-cron           re-render tools-public.json + /etc/cron.d/chassis (no restart)
+  ./chassis run <agent> [task]    one-shot when task is given; interactive otherwise
+  ./chassis shell [--root]        agent-user shell (or root with --root)
+  ./chassis logs [agent]          tail dispatcher audit log, or per-agent run logs
+  ./chassis status                container state + cron file + recent log activity
+  ./chassis test <name> [--set K=V ...]   spin up an ephemeral container, run harness/tests/<name>, tear down
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent
+ENV_EXAMPLE = REPO / ".env.example"
+ENV_FILE = REPO / ".env"
+LLM_ENV_FILE = REPO / "harness" / "llm.env"
+
+
+def chassis_name() -> str:
+    """CHASSIS_NAME env wins; otherwise the current git branch is the chassis
+    name (sanitized to docker-safe chars), with `main` falling back to
+    `default` so a fresh clone produces a `default-chassis` rather than a
+    `main-chassis`. Used to namespace container/volumes/network so multiple
+    chassis can coexist on one host.
+    """
+    if os.environ.get("CHASSIS_NAME"):
+        return os.environ["CHASSIS_NAME"]
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(REPO), "branch", "--show-current"],
+            capture_output=True, text=True, check=False,
+        )
+        branch = r.stdout.strip()
+    except FileNotFoundError:
+        return "default"
+    if not branch or branch == "main":
+        return "default"
+    safe = re.sub(r"[^a-z0-9._-]", "-", branch.lower()).lstrip("-")
+    return safe or "default"
+
+
+NAME = chassis_name()
+CONTAINER = f"{NAME}-chassis"
+PROJECT = f"{NAME}-chassis"
+
+
+def attach_llm_container() -> None:
+    """If LLM_CONTAINER is set in harness/llm.env, attach it to the chassis
+    docker network with alias `llm`. Idempotent.
+    """
+    name = ""
+    if LLM_ENV_FILE.exists():
+        for line in LLM_ENV_FILE.read_text().splitlines():
+            s = line.strip()
+            if s.startswith("LLM_CONTAINER="):
+                name = s.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    if not name:
+        return
+    inspect = run(
+        ["docker", "inspect", CONTAINER, "--format",
+         "{{range $n, $_ := .NetworkSettings.Networks}}{{$n}}\n{{end}}"],
+        capture_output=True, text=True,
+    )
+    if inspect.returncode != 0:
+        return
+    networks = [n for n in inspect.stdout.strip().splitlines() if n]
+    if not networks:
+        return
+    run(
+        ["docker", "network", "connect", "--alias", "llm", networks[0], name],
+        capture_output=True, text=True,
+    )
+
+
+def die(msg: str, code: int = 1) -> "None":
+    print(f"chassis: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, **kwargs)
+
+
+def compose(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    env = {**os.environ, "CHASSIS_NAME": NAME}
+    return run(
+        ["docker", "compose", "--project-name", PROJECT, *args],
+        cwd=REPO, env=env, **kwargs,
+    )
+
+
+def exec_in(cmd: list[str], *, user: str = "agent", interactive: bool = False) -> int:
+    flags = ["-i"] if interactive else []
+    if interactive and sys.stdout.isatty():
+        flags.append("-t")
+    return run(["docker", "exec", *flags, "-u", user, CONTAINER, *cmd]).returncode
+
+
+def cmd_init(_args: argparse.Namespace) -> int:
+    if ENV_FILE.exists():
+        print(f".env already exists at {ENV_FILE} — leaving it alone.")
+        return 0
+    if not ENV_EXAMPLE.exists():
+        die(".env.example missing; can't scaffold")
+    shutil.copy(ENV_EXAMPLE, ENV_FILE)
+    ENV_FILE.chmod(0o600)
+    print(f"wrote {ENV_FILE} (mode 600). Edit it before `./chassis up`.")
+    return 0
+
+
+def cmd_up(_args: argparse.Namespace) -> int:
+    if not ENV_FILE.exists():
+        die("no .env — run `./chassis init` first.")
+    rc = compose(["up", "-d", "--build"]).returncode
+    if rc == 0:
+        attach_llm_container()
+    return rc
+
+
+def cmd_down(_args: argparse.Namespace) -> int:
+    return compose(["down"]).returncode
+
+
+def cmd_reload_cron(_args: argparse.Namespace) -> int:
+    """Re-render /etc/chassis/tools-public.json and /etc/cron.d/chassis."""
+    return run(
+        ["docker", "exec", "-u", "root", CONTAINER,
+         "/usr/local/bin/chassis-entrypoint", "--reload"]
+    ).returncode
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    cmd = ["/usr/local/bin/run-claude", args.agent]
+    if args.task:
+        cmd.append(args.task)
+    return exec_in(cmd, user="agent", interactive=args.task is None)
+
+
+def cmd_login(_args: argparse.Namespace) -> int:
+    """Open the interactive Claude Code login inside the running container.
+    Credentials land under /home/agent/.claude/ on the agent-home volume, so
+    they persist across container restarts and every `chassis run` / cron
+    task reuses the same session.
+    """
+    rc = exec_in(["claude", "/login"], user="agent", interactive=True)
+    if rc == 0:
+        print("chassis: login complete; credentials persist on the agent-home volume.")
+    else:
+        print(
+            f"chassis: `claude /login` exited {rc}. Re-run `./chassis login` to retry.",
+            file=sys.stderr,
+        )
+    return rc
+
+
+def cmd_setup(_args: argparse.Namespace) -> int:
+    """Drop into the onboarding wizard. Re-runnable any time — handy as a
+    refresher or for scaffolding more agents later. The template seed only
+    fires on virgin home volumes, so if the operator built this image before
+    onboarding was added, ensure the agent dir exists first.
+    """
+    ensure = (
+        "if [ ! -d /home/agent/onboarding ]; then "
+        "cp -r /usr/local/share/chassis/agent-template/onboarding /home/agent/onboarding "
+        "&& chown -R agent:agent /home/agent/onboarding; "
+        "fi"
+    )
+    rc = exec_in(["bash", "-c", ensure], user="root")
+    if rc != 0:
+        return rc
+    return exec_in(["/usr/local/bin/run-claude", "onboarding"], user="agent", interactive=True)
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    if args.agent:
+        target = f"/var/log/chassis/agents/{args.agent}"
+        return exec_in(
+            ["sh", "-c", f'find "{target}" -type f -name "*.jsonl" -printf "%T@ %p\\n" 2>/dev/null '
+                          f'| sort -n | tail -20 | awk "{{print \\$2}}" | xargs -r tail -n +1'],
+            user="agent",
+        )
+    return exec_in(
+        ["sh", "-c", "tail -n 50 /var/log/chassis/run-tool.jsonl"],
+        user="agent",
+    )
+
+
+def cmd_shell(args: argparse.Namespace) -> int:
+    user = "root" if args.root else "agent"
+    return exec_in(["bash"], user=user, interactive=True)
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    """Spin up a throwaway, fully-namespaced chassis, run a test script
+    inside it, then tear everything down. The test image is reused across
+    runs (tag `chassis-test:latest`); container/volumes/network are unique
+    per run and removed by `compose down -v`.
+
+    --set KEY=VAL overrides go into the container's `environment:`, which
+    takes precedence over harness/llm.env.
+    """
+    if not ENV_FILE.exists():
+        die("no .env — run `./chassis init` first (the bind mount needs a real file).")
+
+    test_script = REPO / "harness" / "tests" / args.name
+    if not test_script.exists():
+        die(f"no test {args.name!r} at {test_script}")
+
+    overrides: list[tuple[str, str]] = []
+    for kv in args.set or []:
+        if "=" not in kv:
+            die(f"--set requires KEY=VAL, got {kv!r}")
+        k, v = kv.split("=", 1)
+        overrides.append((k, v))
+
+    test_id = f"test-{uuid.uuid4().hex[:8]}"
+    test_project = f"{test_id}-chassis"
+    test_container = f"{test_id}-chassis"
+    test_image = "chassis-test:latest"
+
+    # Override compose file: pin image tag (so we don't pile up images
+    # across runs), disable restart, inject env overrides.
+    override = {
+        "services": {
+            "chassis": {
+                "image": test_image,
+                "restart": "no",
+                **({"environment": {k: v for k, v in overrides}} if overrides else {}),
+            }
+        }
+    }
+    override_yaml = _to_yaml(override)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write(override_yaml)
+        override_path = f.name
+
+    env = {**os.environ, "CHASSIS_NAME": test_id}
+
+    def compose_t(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["docker", "compose", "--project-name", test_project,
+             "-f", "compose.yaml", "-f", override_path, *cmd],
+            cwd=REPO, env=env, **kw,
+        )
+
+    print(f"[{test_id}] build + up")
+    try:
+        rc = compose_t(["up", "-d", "--build"]).returncode
+        if rc != 0:
+            return rc
+
+        print(f"[{test_id}] waiting for entrypoint")
+        ready = False
+        for _ in range(60):
+            check = subprocess.run(
+                ["docker", "exec", test_container, "test", "-f",
+                 "/run/chassis-ready"],
+                capture_output=True,
+            )
+            if check.returncode == 0:
+                ready = True
+                break
+            time.sleep(0.5)
+        if not ready:
+            print(f"[{test_id}] entrypoint never finished — container logs:")
+            subprocess.run(["docker", "logs", test_container])
+            return 1
+
+        # The ephemeral chassis has a fresh agent-home volume, so it inherits
+        # no Anthropic credentials from the live chassis. Run `claude /login`
+        # interactively before the test script so the operator only has to
+        # auth once per test invocation.
+        print(f"[{test_id}] login — complete the OAuth flow; ping runs after it exits")
+        login_rc = subprocess.run(
+            ["docker", "exec", "-it", "-u", "agent", test_container,
+             "claude", "/login"],
+        ).returncode
+        if login_rc != 0:
+            print(f"[{test_id}] `claude /login` exited {login_rc} — skipping test")
+            return login_rc
+
+        print(f"[{test_id}] running {args.name}")
+        subprocess.run(
+            ["docker", "cp", str(test_script), f"{test_container}:/tmp/chassis-test"],
+            check=True,
+        )
+        subprocess.run(
+            ["docker", "exec", "-u", "root", test_container,
+             "chmod", "+x", "/tmp/chassis-test"],
+            check=True,
+        )
+        result = subprocess.run(
+            ["docker", "exec", "-u", "agent", test_container, "/tmp/chassis-test"],
+        )
+        return result.returncode
+    finally:
+        print(f"[{test_id}] teardown")
+        compose_t(["down", "-v", "--remove-orphans"], capture_output=True)
+        try:
+            os.unlink(override_path)
+        except OSError:
+            pass
+
+
+def _to_yaml(obj, indent: int = 0) -> str:
+    """Minimal dict/list → YAML emitter so we don't depend on PyYAML.
+    All scalars round-trip safely through JSON."""
+    pad = "  " * indent
+    if isinstance(obj, dict):
+        if not obj:
+            return "{}\n"
+        out = ""
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)) and v:
+                out += f"{pad}{k}:\n{_to_yaml(v, indent + 1)}"
+            else:
+                out += f"{pad}{k}: {json.dumps(v)}\n"
+        return out
+    if isinstance(obj, list):
+        return "".join(f"{pad}- {json.dumps(x)}\n" for x in obj)
+    return f"{pad}{json.dumps(obj)}\n"
+
+
+WRAPPER_MARKER_BEGIN = "# chassis-wrapper-begin"
+WRAPPER_SH = r"""
+# chassis-wrapper-begin — run ./chassis from any worktree (idempotent; safe to keep)
+chassis() {
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "chassis: not in a git repo" >&2; return 1; }
+  if [ ! -x "$root/chassis" ]; then
+    echo "chassis: $root has no executable ./chassis script" >&2
+    return 1
+  fi
+  "$root/chassis" "$@"
+}
+# chassis-wrapper-end
+"""
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Append a `chassis` shell function to the user's rc file so the CLI is
+    invokable as `chassis` from any worktree (and any subdirectory of one).
+    Idempotent: rerunning is a no-op once the marker is present.
+
+    --print emits the wrapper to stdout without touching any rc file — handy
+    for non-bash/zsh shells or for piping into a custom location.
+    """
+    if args.print:
+        sys.stdout.write(WRAPPER_SH)
+        return 0
+
+    rc_map = {"bash": ".bashrc", "zsh": ".zshrc"}
+    shell_name = Path(os.environ.get("SHELL", "")).name
+    if shell_name not in rc_map:
+        print(
+            f"chassis: SHELL is {shell_name or '(unset)'!r}; only bash and zsh "
+            "are auto-installed. Run `./chassis install --print` and paste the "
+            "output into your shell's rc file.",
+            file=sys.stderr,
+        )
+        return 1
+    rc = Path.home() / rc_map[shell_name]
+
+    if rc.exists() and WRAPPER_MARKER_BEGIN in rc.read_text():
+        print(f"chassis: wrapper already present in {rc} — nothing to do.")
+        return 0
+
+    with rc.open("a") as f:
+        f.write(WRAPPER_SH)
+    print(f"chassis: appended wrapper to {rc}.")
+    print(f"chassis: run `source {rc}` (or open a new shell) to activate.")
+    return 0
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    ps = run(
+        ["docker", "ps", "--filter", f"name={CONTAINER}", "--format",
+         "{{.Names}}\t{{.Status}}\t{{.RunningFor}}"],
+        capture_output=True, text=True,
+    )
+    print(f"=== container ({NAME}) ===")
+    print(ps.stdout.strip() or f"{CONTAINER}: not running")
+    if not ps.stdout.strip():
+        return 0
+    print()
+    print("=== /etc/cron.d/chassis ===")
+    exec_in(["cat", "/etc/cron.d/chassis"], user="root")
+    print()
+    print("=== last 5 run-tool entries ===")
+    exec_in(
+        ["sh", "-c", "tail -n 5 /var/log/chassis/run-tool.jsonl 2>/dev/null || echo '(no audit log yet)'"],
+        user="agent",
+    )
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="chassis", description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init",        help="scaffold .env from .env.example").set_defaults(func=cmd_init)
+    sub.add_parser("up",          help="docker compose up -d --build").set_defaults(func=cmd_up)
+    sub.add_parser("down",        help="docker compose down").set_defaults(func=cmd_down)
+    sub.add_parser("setup",       help="onboarding wizard — scaffolds your first agent").set_defaults(func=cmd_setup)
+    sub.add_parser("login",       help="interactive Anthropic login; credentials persist on the agent-home volume").set_defaults(func=cmd_login)
+    sub.add_parser("reload-cron", help="re-render tools-public.json + cron").set_defaults(func=cmd_reload_cron)
+
+    p_run = sub.add_parser("run", help="interactive if task omitted, one-shot otherwise")
+    p_run.add_argument("agent")
+    p_run.add_argument("task", nargs="?", default=None)
+    p_run.set_defaults(func=cmd_run)
+
+    p_logs = sub.add_parser("logs", help="tail dispatcher audit log or per-agent run logs")
+    p_logs.add_argument("agent", nargs="?", default=None)
+    p_logs.set_defaults(func=cmd_logs)
+
+    p_shell = sub.add_parser("shell", help="shell in the container (default: agent user)")
+    p_shell.add_argument("--root", action="store_true", help="open as root instead of agent")
+    p_shell.set_defaults(func=cmd_shell)
+
+    sub.add_parser("status",      help="container + cron + log summary").set_defaults(func=cmd_status)
+
+    p_install = sub.add_parser(
+        "install",
+        help="add a `chassis` shell function to ~/.bashrc or ~/.zshrc",
+    )
+    p_install.add_argument(
+        "--print", action="store_true",
+        help="print the wrapper to stdout instead of editing any rc file",
+    )
+    p_install.set_defaults(func=cmd_install)
+
+    p_test = sub.add_parser("test", help="run harness/tests/<name> in an ephemeral container")
+    p_test.add_argument("name", help="script under harness/tests/ (e.g. ping)")
+    p_test.add_argument("--set", action="append", metavar="KEY=VAL",
+                        help="env override (repeatable); wins over harness/llm.env and .env")
+    p_test.set_defaults(func=cmd_test)
+
+    args = p.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

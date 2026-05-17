@@ -1,0 +1,19 @@
+{
+  "name": "chassis-mcp",
+  "version": "0.1.0",
+  "description": "Stdio MCP server that exposes the chassis tool surface to Claude Code.",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.11.0"
+  }
+}
