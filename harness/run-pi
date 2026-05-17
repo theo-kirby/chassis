@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+#
+# run-pi — drop privileges (when invoked as root) and exec `pi` with the
+# chassis extension loaded. With a task, runs one-shot via --print using the
+# task's INSTRUCTIONS.md as prompt; without, runs interactive (TUI).
+
+set -euo pipefail
+
+agent="${1:-}"
+task="${2:-}"
+
+if [[ -z "$agent" ]]; then
+    echo "Usage: run-pi <agent> [task]" >&2
+    exit 1
+fi
+
+export CHASSIS_AGENT="$agent"
+export CHASSIS_TASK="$task"
+
+extra=()
+prompt=""
+
+if [[ -n "$task" ]]; then
+    instructions="/home/agent/$agent/$task/INSTRUCTIONS.md"
+    if [[ ! -f "$instructions" ]]; then
+        echo "run-pi: task instructions not found at $instructions" >&2
+        exit 1
+    fi
+    prompt="$(cat "$instructions")"
+    # --print: non-interactive; pi processes the prompt and exits.
+    # Session is kept so the per-agent run log can record session_file and
+    # the operator can replay the model's reasoning if a task misbehaves.
+    extra+=(--print)
+fi
+
+# Resolve which model pi should use. agent.json:model is the per-agent
+# override (a pattern like "llm/Qwen/Qwen3-4B" or a glob like "*Qwen3*").
+# When unset, fall back to the chassis default — composed from the
+# LLM_MODEL_ID env var (sourced from harness/llm.env).
+AGENT_JSON="/home/agent/$agent/agent.json"
+model=""
+if [[ -f "$AGENT_JSON" ]]; then
+    model="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("model","") or "")' "$AGENT_JSON")"
+fi
+if [[ -z "$model" && -n "${LLM_MODEL_ID:-}" ]]; then
+    model="llm/${LLM_MODEL_ID}"
+fi
+if [[ -n "$model" ]]; then
+    extra+=(--model "$model")
+fi
+
+# Thinking level (off|minimal|low|medium|high|xhigh|empty). Sourced from
+# LLM_THINKING in harness/llm.env.
+if [[ -n "${LLM_THINKING:-}" ]]; then
+    extra+=(--thinking "$LLM_THINKING")
+fi
+
+# /usr/local/lib/chassis-ext is the dist/ output of `tsc`; entry is index.js.
+EXT=/usr/local/lib/chassis-ext/index.js
+
+cmd=(pi "${extra[@]}" --no-builtin-tools -e "$EXT")
+[[ -n "$prompt" ]] && cmd+=("$prompt")
+if [[ $(id -u) -eq 0 ]]; then
+    exec runuser -u agent -- env CHASSIS_AGENT="$agent" CHASSIS_TASK="$task" "${cmd[@]}"
+else
+    exec "${cmd[@]}"
+fi

@@ -1,0 +1,18 @@
+{
+  "name": "chassis-pi-extension",
+  "version": "0.1.0",
+  "description": "Pi extension that wires chassis-managed tools and agent identity into Pi sessions.",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.11.0",
+    "@earendil-works/pi-coding-agent": "0.74.0",
+    "@earendil-works/pi-ai": "0.74.0"
+  }
+}

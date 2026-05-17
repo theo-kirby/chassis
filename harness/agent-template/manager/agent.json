@@ -1,0 +1,5 @@
+{
+  "tools": [],
+  "pi_defaults": ["read", "write", "edit", "bash"],
+  "model": ""
+}

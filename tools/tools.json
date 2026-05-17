@@ -1,0 +1,39 @@
+{
+  "tools": [
+    {
+      "name": "web-search",
+      "description": "Search the web via Tavily. Returns up to max_results entries of {title, url, content (≤1500 chars)}.",
+      "script": "web-search",
+      "runner": "python3",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "query":        {"type": "string", "minLength": 1},
+          "max_results":  {"type": "integer", "minimum": 1, "maximum": 10},
+          "search_depth": {"type": "string", "enum": ["basic", "advanced"]}
+        },
+        "required": ["query"],
+        "additionalProperties": false
+      },
+      "secrets": ["TAVILY_API_KEY"]
+    },
+    {
+      "name": "web-fetch",
+      "description": "Fetch a URL (http/https only). By default the response is run through an HTML/XML tag stripper and capped at 25000 chars — keeps LLM context manageable for typical pages and feeds. Pass `raw: true` to get the unparsed body (still char-capped). Pass `max_chars` (1000-200000) to override the cap. Default timeout 15s.",
+      "script": "web-fetch",
+      "runner": "python3",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "url":       {"type": "string", "format": "uri"},
+          "timeout_s": {"type": "integer", "minimum": 1, "maximum": 60},
+          "raw":       {"type": "boolean"},
+          "max_chars": {"type": "integer", "minimum": 1000, "maximum": 200000}
+        },
+        "required": ["url"],
+        "additionalProperties": false
+      },
+      "secrets": []
+    }
+  ]
+}

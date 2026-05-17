@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Fetch a URL via curl, then strip HTML/XML to readable text.
+
+args:
+  url: required, http/https.
+  timeout_s: 1-60, default 15.
+  raw: bool, default false. True returns the raw response body unchanged.
+  max_chars: 1000-200000, default 25000. Cap on the returned string length.
+
+Why strip by default: returning raw HTML to an LLM is a context-window
+disaster (a typical news page is 30k-100k+ tokens of <script>/<style>/markup
+noise). Stripping with stdlib html.parser brings most pages under 10k tokens
+without losing the substance.
+"""
+
+import html.parser
+import json
+import re
+import subprocess
+import sys
+import urllib.parse
+
+DEFAULT_MAX_CHARS = 25000
+SKIP_TAGS = {"script", "style", "svg", "noscript"}
+# Block-level tags whose close should emit a newline so structure survives.
+# Includes the common RSS/Atom item delimiters so feeds stay readable.
+BLOCK_TAGS = {
+    "p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+    "tr", "td", "th", "section", "article", "header", "footer", "nav",
+    "blockquote", "pre", "title",
+    "item", "entry", "description", "summary", "pubdate", "published",
+    "updated", "guid",
+}
+
+
+class TextExtractor(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in SKIP_TAGS:
+            self.skip_depth += 1
+        elif tag == "br" and self.skip_depth == 0:
+            self.parts.append("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        # Self-closing like <br/> or <meta />. Only <br> emits content.
+        if tag == "br" and self.skip_depth == 0:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in SKIP_TAGS:
+            if self.skip_depth > 0:
+                self.skip_depth -= 1
+            return
+        if tag in BLOCK_TAGS and self.skip_depth == 0:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self.skip_depth == 0:
+            self.parts.append(data)
+
+    def get_text(self) -> str:
+        raw = "".join(self.parts)
+        lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in raw.splitlines()]
+        text = "\n".join(lines)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+def strip_to_text(body: str) -> str:
+    """Heuristic: only run the HTML parser if the body looks like markup.
+    For plain JSON/text, return as-is (still subject to char cap)."""
+    stripped = body.lstrip()
+    if not stripped.startswith("<"):
+        return body
+    p = TextExtractor()
+    try:
+        p.feed(body)
+        p.close()
+    except Exception:
+        # Parser failure: fall back to returning the body unchanged.
+        return body
+    return p.get_text()
+
+
+def main() -> int:
+    args = json.loads(sys.argv[1])
+    url = args["url"]
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        print(f"unsupported scheme: {parsed.scheme!r} (http/https only)", file=sys.stderr)
+        return 2
+
+    timeout = args.get("timeout_s", 15)
+    raw_mode = bool(args.get("raw", False))
+    max_chars = int(args.get("max_chars", DEFAULT_MAX_CHARS))
+
+    result = subprocess.run(
+        [
+            "curl", "-sSL",
+            "--max-time", str(timeout),
+            "--max-filesize", "2000000",
+            "--proto", "=http,=https",
+            "--user-agent", "chassis-web-fetch/0.1",
+            url,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return result.returncode
+
+    body = result.stdout
+    output = body if raw_mode else strip_to_text(body)
+    if len(output) > max_chars:
+        truncated = len(output) - max_chars
+        output = output[:max_chars] + f"\n\n[...truncated {truncated} chars]"
+    sys.stdout.write(output)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

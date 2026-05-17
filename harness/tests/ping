@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""
+ping — fire a one-shot completion at the configured LLM endpoint.
+
+Reads /home/agent/.pi/agent/models.json (rendered by the entrypoint from
+LLM_* env vars + .env's LLM_API_KEY) and POSTs a short request. Exits
+non-zero on any failure. Stdlib only — no extra deps in the test image.
+"""
+import json
+import sys
+import urllib.error
+import urllib.request
+
+CFG = "/home/agent/.pi/agent/models.json"
+PROMPT = "Reply with the single word: pong"
+
+
+def main() -> int:
+    with open(CFG) as f:
+        p = json.load(f)["providers"]["llm"]
+
+    base  = p["baseUrl"].rstrip("/")
+    model = p["models"][0]["id"]
+    key   = p.get("apiKey", "")
+    kind  = p.get("api", "openai-completions")
+
+    print(f"endpoint : {base}")
+    print(f"model    : {model}")
+    print(f"api kind : {kind}")
+    print(f"api key  : {'set' if key and key != 'unused' else repr(key)}")
+
+    if kind != "openai-completions":
+        print(f"ping: only openai-completions supported (got {kind!r})", file=sys.stderr)
+        return 2
+    if not model:
+        print("ping: LLM_MODEL_ID is unset", file=sys.stderr)
+        return 2
+
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": PROMPT}],
+        "max_tokens": 16,
+        "stream": False,
+    }).encode()
+
+    req = urllib.request.Request(f"{base}/chat/completions", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if key and key != "unused":
+        req.add_header("Authorization", f"Bearer {key}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        print(f"ping: HTTP {e.code}", file=sys.stderr)
+        print(e.read().decode(errors="replace"), file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"ping: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    print(f"response : {content!r}")
+    print("OK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
