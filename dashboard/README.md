@@ -29,14 +29,6 @@ pip install 'fastapi>=0.110' 'uvicorn>=0.27' 'croniter>=2.0'
 python app.py
 ```
 
-## Demo mode
-
-```sh
-./app.py --demo
-```
-
-Serves synthetic state — three plausible chassis, a mix of audit entries (one denied), realistic cron next-fire times — without touching docker at all. Useful for screenshots, demos, or iterating on the UI without running real chassis. Drill-in panels are mocked too; click around to verify.
-
 ## Remote access via Tailscale
 
 Bind to all interfaces and reach the dashboard at your machine's tailnet name:

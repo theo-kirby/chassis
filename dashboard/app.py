@@ -30,7 +30,7 @@ import asyncio
 import json
 import re
 import shlex
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -250,399 +250,13 @@ async def chassis_snapshot(meta: dict, stats: dict[str, dict]) -> dict:
     return snap
 
 
-# ---------- demo mode ----------------------------------------------------
-# `--demo` short-circuits the three API routes and returns synthetic state.
-# Timestamps regenerate per request so the dashboard always looks live —
-# good for screenshots and for iterating on the UI without running real
-# chassis. Touches nothing on disk; not a "seed real containers" mode.
-
-def _iso(dt: datetime) -> str:
-    return dt.replace(microsecond=0).isoformat()
-
-
-# Shared runtime config for all demo chassis — surfaces in the top bar.
-# (In real mode chassis_snapshot() can populate the same fields by reading
-# /home/agent/.pi/agent/models.json for `model`/`source` and a future
-# harness marker file for `harness`.)
-DEMO_RUNTIME = {
-    "harness": "pi",
-    "model":   "Qwen/Qwen3.6-35B-A3B",
-    "source":  "host3-5090-vLLM",
-}
-
-
-def _agent(name: str, *, last_task: str | None, mins_ago: float | None) -> dict:
-    if mins_ago is None:
-        return {"name": name, "last_run": None}
-    when = datetime.now(timezone.utc) - timedelta(minutes=mins_ago)
-    safe_task = (last_task or "run").replace("_", "-")
-    return {"name": name, "last_run": {
-        "mtime": when.timestamp(),
-        "path": f"/var/log/chassis/agents/{name}/{safe_task}/{when.strftime('%Y-%m-%dT%H-%M-%S')}.jsonl",
-        "task": last_task,
-        "ts": _iso(when),
-    }}
-
-
-def demo_state() -> dict:
-    """Synthetic chassis fleet emphasizing multi-agent coordination patterns —
-    blackboard consensus, adversarial debate, distributed search, internal
-    markets, theorem exploration. Each chassis runs several agents that
-    talk to each other through shared state (blackboard / queue / kv) or
-    peer RPC, not just to the outside world."""
-    now = datetime.now(timezone.utc)
-    def ago(mins: float) -> str: return _iso(now - timedelta(minutes=mins))
-    def in_mins(mins: float) -> str: return _iso(now + timedelta(minutes=mins))
-
-    chassis: list[dict] = []
-
-    # 1. swarm-consensus (v1) — proposer / validator / aggregator coordinate
-    # entirely through a shared in-chassis blackboard. No agent calls another
-    # directly; the blackboard is the bus. A denied cross-chassis peer-rpc
-    # at the bottom shows the isolation boundary against v2.
-    chassis.append({
-        "name": "swarm-consensus-chassis",
-        "project": "swarm-consensus-chassis",
-        "status_line": "Up 3 days",
-        "status": "running",
-        "started_at": _iso(now - timedelta(days=3)),
-        "restart_count": 0,
-        "running": True,
-        "stats": {"cpu": "2.18%", "mem": "147.3MiB / 7.7GiB", "mem_pct": "1.87%"},
-        "agents": [
-            _agent("proposer",   last_task="propose", mins_ago=2),
-            _agent("validator",  last_task="vote",    mins_ago=1),
-            _agent("aggregator", last_task="tally",   mins_ago=4),
-            _agent("manager",    last_task=None,      mins_ago=None),
-        ],
-        "audit": [
-            {"ts": ago(1),  "tool": "blackboard-read", "args": '{"key":"round/0418/proposals"}',                                       "status": "ok",     "exit": 0, "duration_ms": 31,  "secrets_passed": []},
-            {"ts": ago(1),  "tool": "vote-submit",     "args": '{"round":418,"proposal":"p2","weight":1}',                             "status": "ok",     "exit": 0, "duration_ms": 44,  "secrets_passed": []},
-            {"ts": ago(2),  "tool": "queue-pop",       "args": '{"queue":"questions"}',                                                "status": "ok",     "exit": 0, "duration_ms": 38,  "secrets_passed": []},
-            {"ts": ago(2),  "tool": "blackboard-post", "args": '{"key":"round/0418/proposals","items":3}',                             "status": "ok",     "exit": 0, "duration_ms": 56,  "secrets_passed": []},
-            {"ts": ago(2),  "tool": "peer-broadcast",  "args": '{"to":"validator","event":"round_open","round":418}',                  "status": "ok",     "exit": 0, "duration_ms": 22,  "secrets_passed": []},
-            {"ts": ago(4),  "tool": "vote-tally",      "args": '{"round":417}',                                                        "status": "ok",     "exit": 0, "duration_ms": 89,  "secrets_passed": []},
-            {"ts": ago(4),  "tool": "kv-write",        "args": '{"key":"consensus/0417","value":"p1"}',                                "status": "ok",     "exit": 0, "duration_ms": 27,  "secrets_passed": []},
-            {"ts": ago(7),  "tool": "peer-rpc",        "args": '{"target":"swarm-consensus-v2-chassis::aggregator","call":"sync"}',   "status": "denied", "exit": 2, "duration_ms": 0,   "reason": "args_schema violation: cross-chassis rpc not permitted", "secrets_passed": []},
-        ],
-        "cron": [
-            {"schedule": "*/3 * * * *", "command": "proposer propose", "next": in_mins(1)},
-            {"schedule": "* * * * *",   "command": "validator vote",   "next": in_mins(1)},
-            {"schedule": "*/5 * * * *", "command": "aggregator tally", "next": in_mins(1)},
-        ],
-    })
-
-    # 2. swarm-consensus (v2) — same blackboard pattern, plus a `reputation`
-    # agent that scores past voters; tallies are weighted by historical
-    # accuracy. Demonstrates iterating on a multi-agent design without
-    # retiring v1 (run both on the same question stream, compare divergence).
-    chassis.append({
-        "name": "swarm-consensus-v2-chassis",
-        "project": "swarm-consensus-v2-chassis",
-        "status_line": "Up 19 hours",
-        "status": "running",
-        "started_at": _iso(now - timedelta(hours=19)),
-        "restart_count": 0,
-        "running": True,
-        "stats": {"cpu": "2.71%", "mem": "163.9MiB / 7.7GiB", "mem_pct": "2.08%"},
-        "agents": [
-            _agent("proposer",   last_task="propose",       mins_ago=1),
-            _agent("validator",  last_task="vote",          mins_ago=1),
-            _agent("aggregator", last_task="weighted-tally",mins_ago=3),
-            _agent("reputation", last_task="update",        mins_ago=7),
-            _agent("manager",    last_task=None,            mins_ago=None),
-        ],
-        "audit": [
-            {"ts": ago(1), "tool": "reputation-fetch",  "args": '{"voter":"v_07"}',                                                    "status": "ok",    "exit": 0, "duration_ms": 18,  "secrets_passed": []},
-            {"ts": ago(1), "tool": "vote-submit",       "args": '{"round":118,"proposal":"p1","weight":0.83}',                         "status": "ok",    "exit": 0, "duration_ms": 41,  "secrets_passed": []},
-            {"ts": ago(1), "tool": "blackboard-post",   "args": '{"key":"round/0118/proposals","items":3}',                            "status": "ok",    "exit": 0, "duration_ms": 52,  "secrets_passed": []},
-            {"ts": ago(3), "tool": "vote-tally",        "args": '{"round":117,"weighted":true}',                                       "status": "ok",    "exit": 0, "duration_ms": 112, "secrets_passed": []},
-            {"ts": ago(3), "tool": "kv-write",          "args": '{"key":"consensus/0117","value":"p2","margin":0.41}',                 "status": "ok",    "exit": 0, "duration_ms": 24,  "secrets_passed": []},
-            {"ts": ago(7), "tool": "reputation-update", "args": '{"round":116,"updated":12}',                                          "status": "ok",    "exit": 0, "duration_ms": 87,  "secrets_passed": []},
-            {"ts": ago(7), "tool": "blackboard-read",   "args": '{"key":"voter/v_03"}',                                                "status": "error", "exit": 1, "duration_ms": 14,  "reason": "key not found: voter/v_03 (stale validator, skipped)", "secrets_passed": []},
-        ],
-        "cron": [
-            {"schedule": "*/3 * * * *", "command": "proposer propose",          "next": in_mins(2)},
-            {"schedule": "* * * * *",   "command": "validator vote",            "next": in_mins(1)},
-            {"schedule": "*/5 * * * *", "command": "aggregator weighted-tally", "next": in_mins(2)},
-            {"schedule": "*/10 * * * *","command": "reputation update",         "next": in_mins(3)},
-        ],
-    })
-
-    # 3. debate-arena — pro/con advocates trade arguments under an impartial
-    # judge; archivist commits the verdict to a shared corpus. Adversarial
-    # pair + neutral scorer is a classic structured-debate MAS pattern. The
-    # denied row shows role-scoped policy: the judge can't search the web.
-    chassis.append({
-        "name": "debate-arena-chassis",
-        "project": "debate-arena-chassis",
-        "status_line": "Up 5 days",
-        "status": "running",
-        "started_at": _iso(now - timedelta(days=5)),
-        "restart_count": 0,
-        "running": True,
-        "stats": {"cpu": "0.62%", "mem": "108.4MiB / 7.7GiB", "mem_pct": "1.38%"},
-        "agents": [
-            _agent("advocate-pro", last_task="argue",           mins_ago=12),
-            _agent("advocate-con", last_task="counter",         mins_ago=11),
-            _agent("judge",        last_task="score",           mins_ago=7),
-            _agent("archivist",    last_task="publish-verdict", mins_ago=3),
-            _agent("manager",      last_task=None,              mins_ago=None),
-        ],
-        "audit": [
-            {"ts": ago(3),  "tool": "verdict-publish", "args": '{"topic":"t_0214","winner":"con","score":7.4}',                       "status": "ok",     "exit": 0, "duration_ms": 142, "secrets_passed": []},
-            {"ts": ago(3),  "tool": "kv-write",        "args": '{"key":"corpus/0214","bytes":3812}',                                  "status": "ok",     "exit": 0, "duration_ms": 38,  "secrets_passed": []},
-            {"ts": ago(7),  "tool": "blackboard-read", "args": '{"key":"topic/0214/rounds"}',                                         "status": "ok",     "exit": 0, "duration_ms": 26,  "secrets_passed": []},
-            {"ts": ago(7),  "tool": "score-round",     "args": '{"topic":"t_0214","round":3,"rubric":"clarity+evidence"}',            "status": "ok",     "exit": 0, "duration_ms": 1183,"secrets_passed": []},
-            {"ts": ago(7),  "tool": "web-search",      "args": '{"query":"survey of recent counterclaims for t_0214"}',               "status": "denied", "exit": 2, "duration_ms": 0,   "reason": "args_schema violation: judge role may not call web-search", "secrets_passed": []},
-            {"ts": ago(11), "tool": "web-search",      "args": '{"query":"counterevidence for claim c_2"}',                           "status": "ok",     "exit": 0, "duration_ms": 1620,"secrets_passed": ["TAVILY_API_KEY"]},
-            {"ts": ago(11), "tool": "peer-broadcast",  "args": '{"to":"judge","event":"round_closed","topic":"t_0214","round":3}',    "status": "ok",     "exit": 0, "duration_ms": 21,  "secrets_passed": []},
-            {"ts": ago(12), "tool": "web-search",      "args": '{"query":"strongest evidence for claim c_2"}',                        "status": "ok",     "exit": 0, "duration_ms": 1554,"secrets_passed": ["TAVILY_API_KEY"]},
-        ],
-        "cron": [
-            {"schedule": "*/15 * * * *", "command": "advocate-pro argue",        "next": in_mins(3)},
-            {"schedule": "*/15 * * * *", "command": "advocate-con counter",      "next": in_mins(4)},
-            {"schedule": "*/20 * * * *", "command": "judge score",               "next": in_mins(13)},
-            {"schedule": "0 * * * *",    "command": "archivist publish-verdict", "next": in_mins(57)},
-        ],
-    })
-
-    # 4. evolution-pool — distributed program/policy search. Tight inner
-    # mutate -> evaluate loop with periodic selection and novelty-aware
-    # archiving. High audit volume; most "work" here is inter-agent state
-    # churn through the shared pool, not external calls.
-    chassis.append({
-        "name": "evolution-pool-chassis",
-        "project": "evolution-pool-chassis",
-        "status_line": "Up 9 days",
-        "status": "running",
-        "started_at": _iso(now - timedelta(days=9)),
-        "restart_count": 0,
-        "running": True,
-        "stats": {"cpu": "8.94%", "mem": "412.6MiB / 7.7GiB", "mem_pct": "5.24%"},
-        "agents": [
-            _agent("mutator",   last_task="spawn",    mins_ago=1),
-            _agent("evaluator", last_task="score",    mins_ago=1),
-            _agent("selector",  last_task="cull",     mins_ago=2),
-            _agent("archivist", last_task="preserve", mins_ago=23),
-            _agent("manager",   last_task=None,       mins_ago=None),
-        ],
-        "audit": [
-            {"ts": ago(1),  "tool": "variant-spawn", "args": '{"parent":"g_88231","ops":["xover","mut(0.04)"]}',                       "status": "ok",    "exit": 0, "duration_ms": 41,   "secrets_passed": []},
-            {"ts": ago(1),  "tool": "fitness-score", "args": '{"genome":"g_88240"}',                                                   "status": "ok",    "exit": 0, "duration_ms": 612,  "secrets_passed": []},
-            {"ts": ago(1),  "tool": "fitness-score", "args": '{"genome":"g_88241"}',                                                   "status": "ok",    "exit": 0, "duration_ms": 588,  "secrets_passed": []},
-            {"ts": ago(2),  "tool": "fitness-score", "args": '{"genome":"g_88238"}',                                                   "status": "error", "exit": 1, "duration_ms": 5012, "reason": "eval sandbox timeout (5s) — variant looped", "secrets_passed": []},
-            {"ts": ago(2),  "tool": "pool-prune",    "args": '{"keep_top":64,"by":"pareto"}',                                          "status": "ok",    "exit": 0, "duration_ms": 173,  "secrets_passed": []},
-            {"ts": ago(2),  "tool": "kv-write",      "args": '{"key":"pool/gen/0431","size":64}',                                      "status": "ok",    "exit": 0, "duration_ms": 26,   "secrets_passed": []},
-            {"ts": ago(23), "tool": "novelty-check", "args": '{"candidates":18,"threshold":0.31}',                                     "status": "ok",    "exit": 0, "duration_ms": 244,  "secrets_passed": []},
-            {"ts": ago(23), "tool": "archive-write", "args": '{"added":4,"archive":"hall_of_fame"}',                                   "status": "ok",    "exit": 0, "duration_ms": 81,   "secrets_passed": []},
-        ],
-        "cron": [
-            {"schedule": "* * * * *",    "command": "mutator spawn",      "next": in_mins(1)},
-            {"schedule": "* * * * *",    "command": "evaluator score",    "next": in_mins(1)},
-            {"schedule": "*/5 * * * *",  "command": "selector cull",      "next": in_mins(3)},
-            {"schedule": "*/30 * * * *", "command": "archivist preserve", "next": in_mins(7)},
-        ],
-    })
-
-    # 5. sys-analysis — distributed root-cause analysis on a target system.
-    # log-scanner and trace-correlator independently survey their own signal
-    # source and post findings to a shared incident blackboard; hypothesizer
-    # reads accumulated findings and submits candidate root causes; probe
-    # runs read-only tests to corroborate or refute. Bidirectional loop —
-    # probe results feed back into the next round of hypotheses.
-    chassis.append({
-        "name": "sys-analysis-chassis",
-        "project": "sys-analysis-chassis",
-        "status_line": "Up 8 days",
-        "status": "running",
-        "started_at": _iso(now - timedelta(days=8)),
-        "restart_count": 0,
-        "running": True,
-        "stats": {"cpu": "0.74%", "mem": "134.2MiB / 7.7GiB", "mem_pct": "1.70%"},
-        "agents": [
-            _agent("log-scanner",      last_task="scan",        mins_ago=1),
-            _agent("trace-correlator", last_task="correlate",   mins_ago=4),
-            _agent("probe",            last_task="test",        mins_ago=2),
-            _agent("hypothesizer",     last_task="hypothesize", mins_ago=6),
-            _agent("manager",          last_task=None,          mins_ago=None),
-        ],
-        "audit": [
-            {"ts": ago(1), "tool": "log-window",         "args": '{"service":"checkout","window":"5m","matches":42}',                       "status": "ok",     "exit": 0, "duration_ms": 218,  "secrets_passed": []},
-            {"ts": ago(1), "tool": "finding-post",       "args": '{"key":"incident/i_2031/findings","kind":"latency-spike","p99_ms":4180}', "status": "ok",     "exit": 0, "duration_ms": 41,   "secrets_passed": []},
-            {"ts": ago(2), "tool": "hypothesis-fetch",   "args": '{"id":"h_0042"}',                                                         "status": "ok",     "exit": 0, "duration_ms": 19,   "secrets_passed": []},
-            {"ts": ago(2), "tool": "probe-run",          "args": '{"cmd":"sql:select count(*) from pg_stat_activity"}',                     "status": "ok",     "exit": 0, "duration_ms": 412,  "secrets_passed": ["PGPASSWORD"]},
-            {"ts": ago(2), "tool": "config-write",       "args": '{"key":"checkout/pool_max","value":48}',                                  "status": "denied", "exit": 2, "duration_ms": 0,    "reason": "args_schema violation: probe role is read-only (mutation requires operator approval)", "secrets_passed": []},
-            {"ts": ago(2), "tool": "peer-broadcast",     "args": '{"to":"hypothesizer","event":"corroborated","id":"h_0042"}',              "status": "ok",     "exit": 0, "duration_ms": 23,   "secrets_passed": []},
-            {"ts": ago(4), "tool": "trace-fetch",        "args": '{"service":"checkout-api","since":"15m"}',                                "status": "error",  "exit": 1, "duration_ms": 8014, "reason": "trace backend timeout (8s)", "secrets_passed": []},
-            {"ts": ago(4), "tool": "finding-post",       "args": '{"key":"incident/i_2031/findings","kind":"slow-span","span":"db.query"}', "status": "ok",     "exit": 0, "duration_ms": 38,   "secrets_passed": []},
-            {"ts": ago(6), "tool": "hypothesis-submit", "args": '{"id":"h_0042","claim":"checkout db pool exhausted","confidence":0.71}',  "status": "ok",     "exit": 0, "duration_ms": 92,   "secrets_passed": []},
-        ],
-        "cron": [
-            {"schedule": "*/2 * * * *",  "command": "log-scanner scan",          "next": in_mins(1)},
-            {"schedule": "*/5 * * * *",  "command": "trace-correlator correlate","next": in_mins(1)},
-            {"schedule": "*/10 * * * *", "command": "hypothesizer hypothesize",  "next": in_mins(4)},
-            {"schedule": "*/5 * * * *",  "command": "probe test",                "next": in_mins(3)},
-        ],
-    })
-
-    # 6. theorem-search — conjecturer proposes lemmas, prover attempts them,
-    # counterexample-search hunts for refutations, librarian curates the
-    # accepted corpus. Three-way collaborative/adversarial loop sharing a
-    # corpus blackboard.
-    chassis.append({
-        "name": "theorem-search-chassis",
-        "project": "theorem-search-chassis",
-        "status_line": "Up 12 days",
-        "status": "running",
-        "started_at": _iso(now - timedelta(days=12)),
-        "restart_count": 1,
-        "running": True,
-        "stats": {"cpu": "4.11%", "mem": "287.2MiB / 7.7GiB", "mem_pct": "3.65%"},
-        "agents": [
-            _agent("conjecturer",           last_task="propose", mins_ago=8),
-            _agent("prover",                last_task="prove",   mins_ago=14),
-            _agent("counterexample-search", last_task="refute",  mins_ago=22),
-            _agent("librarian",             last_task="curate",  mins_ago=90),
-            _agent("manager",               last_task=None,      mins_ago=None),
-        ],
-        "audit": [
-            {"ts": ago(8),  "tool": "corpus-read",       "args": '{"tag":"abelian-cat"}',                                              "status": "ok",    "exit": 0, "duration_ms": 88,   "secrets_passed": []},
-            {"ts": ago(8),  "tool": "conjecture-submit","args": '{"id":"c_2204","statement":"forall f g : ..., ..."}',                 "status": "ok",    "exit": 0, "duration_ms": 64,   "secrets_passed": []},
-            {"ts": ago(14), "tool": "conjecture-fetch", "args": '{"id":"c_2203"}',                                                    "status": "ok",    "exit": 0, "duration_ms": 19,   "secrets_passed": []},
-            {"ts": ago(14), "tool": "proof-check",      "args": '{"id":"c_2203","backend":"lean"}',                                   "status": "ok",    "exit": 0, "duration_ms": 4218, "secrets_passed": []},
-            {"ts": ago(14), "tool": "kv-write",         "args": '{"key":"proved/c_2203","backend":"lean"}',                           "status": "ok",    "exit": 0, "duration_ms": 22,   "secrets_passed": []},
-            {"ts": ago(22), "tool": "conjecture-fetch", "args": '{"id":"c_2202"}',                                                    "status": "ok",    "exit": 0, "duration_ms": 18,   "secrets_passed": []},
-            {"ts": ago(22), "tool": "smt-solve",        "args": '{"id":"c_2202","budget_s":30}',                                      "status": "error", "exit": 1, "duration_ms": 30041,"reason": "smt timeout: no counterexample within budget", "secrets_passed": []},
-            {"ts": ago(90), "tool": "corpus-write",     "args": '{"accepted":3,"deferred":11}',                                       "status": "ok",    "exit": 0, "duration_ms": 207,  "secrets_passed": []},
-        ],
-        "cron": [
-            {"schedule": "*/10 * * * *", "command": "conjecturer propose",          "next": in_mins(2)},
-            {"schedule": "*/15 * * * *", "command": "prover prove",                 "next": in_mins(1)},
-            {"schedule": "*/20 * * * *", "command": "counterexample-search refute", "next": in_mins(18)},
-            {"schedule": "30 */2 * * *", "command": "librarian curate",             "next": in_mins(30)},
-        ],
-    })
-
-    # 7. world-model — stopped. A curiosity-driven exploration prototype
-    # (scout generates surprising states, modeler updates a learned
-    # transition model, critic scores novelty). Retired in favor of the
-    # evolution-pool design; kept so the dashboard's "down" card style
-    # has a representative.
-    chassis.append({
-        "name": "world-model-chassis",
-        "project": "world-model-chassis",
-        "status_line": "Exited (0) 2 hours ago",
-        "status": "exited",
-        "started_at": _iso(now - timedelta(hours=10)),
-        "restart_count": 2,
-        "running": False,
-        "stats": {},
-    })
-
-    # Stamp shared runtime config (harness, LLM) on every chassis so the top
-    # bar can surface it. Done here rather than inline so the dict literals
-    # above stay focused on the per-chassis state.
-    for c in chassis:
-        c.update(DEMO_RUNTIME)
-
-    return {"generated_at": _iso(now), "chassis": chassis}
-
-
-# Per-agent task pool for drill-in run lists. Falls back to "run" for unknown agents.
-_DEMO_TASKS = {
-    "proposer":              ["propose"],
-    "validator":             ["vote"],
-    "aggregator":            ["tally", "weighted-tally"],
-    "reputation":            ["update"],
-    "advocate-pro":          ["argue"],
-    "advocate-con":          ["counter"],
-    "judge":                 ["score"],
-    "archivist":             ["publish-verdict", "preserve"],
-    "mutator":               ["spawn"],
-    "evaluator":             ["score"],
-    "selector":              ["cull"],
-    "log-scanner":           ["scan"],
-    "trace-correlator":      ["correlate"],
-    "hypothesizer":          ["hypothesize"],
-    "probe":                 ["test"],
-    "conjecturer":           ["propose"],
-    "prover":                ["prove"],
-    "counterexample-search": ["refute"],
-    "librarian":             ["curate"],
-}
-
-
-def demo_runs(_chassis: str, agent: str) -> list[dict]:
-    now = datetime.now(timezone.utc)
-    tasks = _DEMO_TASKS.get(agent, ["run"])
-    runs: list[dict] = []
-    # Cadence per agent — controls the spacing between rows in the drill-in.
-    if agent in ("mutator", "evaluator", "validator"):
-        step_mins = 1
-    elif agent == "log-scanner":
-        step_mins = 2
-    elif agent == "proposer":
-        step_mins = 3
-    elif agent in ("aggregator", "selector", "trace-correlator", "probe"):
-        step_mins = 5
-    elif agent in ("reputation", "conjecturer", "hypothesizer"):
-        step_mins = 10
-    elif agent in ("advocate-pro", "advocate-con", "prover"):
-        step_mins = 15
-    elif agent in ("judge", "counterexample-search"):
-        step_mins = 20
-    elif agent == "archivist":
-        step_mins = 30
-    elif agent == "librarian":
-        step_mins = 60 * 2
-    else:
-        step_mins = 60 * 12  # safe fallback
-    for i in range(10):
-        when = now - timedelta(minutes=step_mins * (i + 1) - 4)
-        task = tasks[i % len(tasks)]
-        runs.append({
-            "mtime": when.timestamp(),
-            "path": f"/var/log/chassis/agents/{agent}/{task}/{when.strftime('%Y-%m-%dT%H-%M-%S')}.jsonl",
-            "ts": _iso(when),
-            "agent": agent,
-            "task": task,
-            "session_file": f"/home/agent/.pi/sessions/{agent}-{when.strftime('%Y%m%dT%H%M%S')}.jsonl",
-        })
-    return runs
-
-
-def demo_file(path: str) -> dict:
-    if "sessions" in path:
-        sample = [
-            {"ts": "2026-05-17T07:00:05Z", "role": "system",    "content": "You are the proposer in a 3-role consensus chassis. Pull the next open question from the blackboard queue, generate 3 distinct candidate answers, post them to round/<n>/proposals, and notify the validator pool."},
-            {"ts": "2026-05-17T07:00:05Z", "role": "user",      "content": "Run a proposal round."},
-            {"ts": "2026-05-17T07:00:06Z", "role": "assistant", "content": "Pulling the next open question off the blackboard queue."},
-            {"ts": "2026-05-17T07:00:06Z", "role": "tool",      "name": "queue-pop",       "content": "{\"id\":\"q_0418\",\"prompt\":\"shortest reduction of expr e_77\"}"},
-            {"ts": "2026-05-17T07:00:07Z", "role": "assistant", "content": "Drafting three candidate reductions with deliberately divergent strategies so validators see a real spread."},
-            {"ts": "2026-05-17T07:00:11Z", "role": "tool",      "name": "blackboard-post", "content": "{\"key\":\"round/0418/proposals\",\"items\":3}"},
-            {"ts": "2026-05-17T07:00:11Z", "role": "assistant", "content": "Opening the round so validators can begin voting."},
-            {"ts": "2026-05-17T07:00:11Z", "role": "tool",      "name": "peer-broadcast",  "content": "{\"to\":\"validator\",\"event\":\"round_open\",\"round\":418}"},
-            {"ts": "2026-05-17T07:00:12Z", "role": "assistant", "content": "Done. Round 418 open with 3 proposals; aggregator will tally on its next tick."},
-        ]
-        return {"path": path, "content": "\n".join(json.dumps(s) for s in sample)}
-    # run log
-    return {
-        "path": path,
-        "content": json.dumps({"ts": "2026-05-17T07:00:04Z", "agent": "proposer", "task": "propose", "session_file": "/home/agent/.pi/sessions/proposer-20260517T070004.jsonl"}),
-    }
-
-
 # ---------- app -----------------------------------------------------------
 
 app = FastAPI(title="chassis dashboard")
-app.state.demo = False
 
 
 @app.get("/api/state")
 async def api_state():
-    if app.state.demo:
-        return JSONResponse(demo_state())
     chassis = await docker_ps_chassis()
     stats = await docker_stats_all()
     snapshots = await asyncio.gather(*(chassis_snapshot(m, stats) for m in chassis))
@@ -658,8 +272,6 @@ async def api_runs(container: str, agent: str, limit: int = 20):
     first JSON line of a run log under /var/log/chassis/agents/<agent>/."""
     if not (_safe_name(container) and _safe_name(agent)):
         return JSONResponse({"error": "invalid name"}, status_code=400)
-    if app.state.demo:
-        return JSONResponse(demo_runs(container, agent)[:max(1, min(limit, 100))])
     limit = max(1, min(limit, 100))
     raw = await exec_in(
         container, "sh", "-c",
@@ -693,8 +305,6 @@ async def api_file(container: str, path: str):
         return JSONResponse({"error": "invalid container"}, status_code=400)
     if not any(path.startswith(p) for p in ALLOWED_FILE_PREFIXES):
         return JSONResponse({"error": "path not allowed"}, status_code=400)
-    if app.state.demo:
-        return JSONResponse(demo_file(path))
     content = await exec_in(
         container, "sh", "-c",
         f"tail -c {FILE_MAX_BYTES} {shlex.quote(path)} 2>/dev/null",
@@ -776,7 +386,6 @@ INDEX_HTML = r"""<!doctype html>
   .badges { position:fixed; bottom:10px; right:12px; display:flex; gap:6px; z-index:40; pointer-events:none; }
   .badge { padding:2px 8px; border-radius:10px; font-size:10px; font-weight:600; letter-spacing:.6px; text-transform:uppercase; border:1px solid; background:#0d1117; }
   .badge.beta { color:#d29922; border-color:#d29922; background:rgba(210,153,34,.10); }
-  .badge.sample { color:#8b949e; border-color:#30363d; background:#161b22; }
 </style>
 </head>
 <body>
@@ -1053,7 +662,6 @@ setInterval(tick,3000);
 </script>
 <div class="badges">
   <span class="badge beta">beta</span>
-  <span class="badge sample">sample-data</span>
 </div>
 </body>
 </html>
@@ -1069,14 +677,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument(
-        "--demo", action="store_true",
-        help="serve synthetic state instead of querying docker — useful for screenshots and UI work",
-    )
     args = ap.parse_args()
-    app.state.demo = args.demo
-    if args.demo:
-        print(f"chassis dashboard: serving DEMO data on http://{args.host}:{args.port}")
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
