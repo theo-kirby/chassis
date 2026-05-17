@@ -274,8 +274,14 @@ def cmd_test(args: argparse.Namespace) -> int:
              "chmod", "+x", "/tmp/chassis-test"],
             check=True,
         )
+        # Allocate a TTY when the operator is on one, so interactive tests
+        # (e.g. `manager`, which drops into the pi TUI) are usable. Headless
+        # tests (ping) don't care either way.
+        exec_flags = ["-i"]
+        if sys.stdout.isatty():
+            exec_flags.append("-t")
         result = subprocess.run(
-            ["docker", "exec", "-u", "agent", test_container, "/tmp/chassis-test"],
+            ["docker", "exec", *exec_flags, "-u", "agent", test_container, "/tmp/chassis-test"],
         )
         return result.returncode
     finally:
@@ -393,6 +399,7 @@ common workflows:
   attach manager   chassis run manager
   after tools/     chassis reload-cron
   smoke test       chassis test ping
+  tool sandbox     chassis test manager
 
 run `chassis <command> --help` for command-specific options.
 """
