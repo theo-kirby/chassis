@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# manager — spin up an ephemeral chassis and drop into the manager pi session.
+# manager — spin up an ephemeral chassis and drop into the manager session.
 # Used as a scratch sandbox for trying new tools / agent prompts: every run
 # starts from a virgin home volume, so changes don't pollute your real chassis.
 # Exit the TUI (Ctrl-D) to trigger teardown.
 
 set -euo pipefail
-exec /usr/local/bin/run-pi manager
+exec /usr/local/bin/run-agent manager

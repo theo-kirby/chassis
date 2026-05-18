@@ -36,9 +36,9 @@ RUN npx tsc \
 
 # Root-owned scripts on PATH.
 COPY harness/run-tool      /usr/local/bin/run-tool
-COPY harness/run-pi        /usr/local/bin/run-pi
+COPY harness/run-agent        /usr/local/bin/run-agent
 COPY harness/entrypoint.sh /usr/local/bin/chassis-entrypoint
-RUN chmod 755 /usr/local/bin/run-tool /usr/local/bin/run-pi /usr/local/bin/chassis-entrypoint
+RUN chmod 755 /usr/local/bin/run-tool /usr/local/bin/run-agent /usr/local/bin/chassis-entrypoint
 
 # Sudoers: agent can call the dispatcher with no password, nothing else.
 RUN echo 'agent ALL=(root) NOPASSWD: /usr/local/bin/run-tool' > /etc/sudoers.d/chassis \

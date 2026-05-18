@@ -145,7 +145,7 @@ def cmd_reload_cron(_args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    cmd = ["/usr/local/bin/run-pi", args.agent]
+    cmd = ["/usr/local/bin/run-agent", args.agent]
     if args.task:
         cmd.append(args.task)
     return exec_in(cmd, user="agent", interactive=args.task is None)
@@ -166,7 +166,7 @@ def cmd_setup(_args: argparse.Namespace) -> int:
     rc = exec_in(["bash", "-c", ensure], user="root")
     if rc != 0:
         return rc
-    return exec_in(["/usr/local/bin/run-pi", "onboarding"], user="agent", interactive=True)
+    return exec_in(["/usr/local/bin/run-agent", "onboarding"], user="agent", interactive=True)
 
 
 def cmd_logs(args: argparse.Namespace) -> int:

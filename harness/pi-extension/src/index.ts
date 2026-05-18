@@ -1,7 +1,7 @@
 /**
  * chassis-pi-extension — wires chassis's tool surface and agent identity into
  * a Pi session. Loaded via `pi -e /usr/local/lib/chassis-ext/index.js`. Reads
- * CHASSIS_AGENT / CHASSIS_TASK (set by run-pi) plus files under
+ * CHASSIS_AGENT / CHASSIS_TASK (set by run-agent) plus files under
  * /home/agent/<agent>/ and /etc/chassis/tools-public.json.
  */
 
@@ -45,7 +45,7 @@ function readMaybe(p: string): string | null {
 function loadAgentContext() {
   const agent = process.env.CHASSIS_AGENT;
   if (!agent) {
-    throw new Error("CHASSIS_AGENT not set; run-pi should have exported it.");
+    throw new Error("CHASSIS_AGENT not set; run-agent should have exported it.");
   }
   const task = process.env.CHASSIS_TASK || "";
   const dir = path.join(AGENT_HOME, agent);
@@ -153,7 +153,7 @@ export default function (pi: ExtensionAPI): void {
   // Action methods: must be called from a handler, not the factory body.
   // Pi was launched with --no-builtin-tools, so nothing is active by default;
   // we expose pi_defaults (built-ins this agent is allowed to use) plus this
-  // agent's chassis tools. Task instructions are passed via argv by run-pi,
+  // agent's chassis tools. Task instructions are passed via argv by run-agent,
   // so we don't inject a user message here.
   pi.on("session_start", async () => {
     const active = [

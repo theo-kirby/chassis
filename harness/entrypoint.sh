@@ -48,9 +48,9 @@ PY
 render_cron() {
     local count=0
     local lines=""
-    # Tasks live at /home/agent/<agent>/<task>/cron — matching the path run-pi
-    # and the Pi extension use for INSTRUCTIONS.md. Globs skip dotfiles, so
-    # .pi/.bashrc/.chassis-seeded don't masquerade as agents.
+    # Tasks live at /home/agent/<agent>/<task>/cron — matching the path
+    # run-agent and the harness extension use for INSTRUCTIONS.md. Globs skip
+    # dotfiles, so .pi/.bashrc/.chassis-seeded don't masquerade as agents.
     for cron_file in "$AGENT_HOME"/*/*/cron; do
         [[ -f "$cron_file" ]] || continue
         local task_dir agent_name task_name schedule
@@ -59,7 +59,7 @@ render_cron() {
         agent_name="$(basename "$(dirname "$task_dir")")"
         schedule="$(grep -v '^[[:space:]]*#' "$cron_file" | grep -v '^[[:space:]]*$' | head -1 || true)"
         [[ -z "$schedule" ]] && continue
-        lines+="$schedule agent /usr/local/bin/run-pi $agent_name $task_name >> $LOG_DIR/cron.log 2>&1"$'\n'
+        lines+="$schedule agent /usr/local/bin/run-agent $agent_name $task_name >> $LOG_DIR/cron.log 2>&1"$'\n'
         count=$((count+1))
     done
     {

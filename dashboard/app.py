@@ -215,7 +215,7 @@ async def cron_jobs(container: str) -> list[dict]:
         expr = f"{m['m']} {m['h']} {m['dom']} {m['mon']} {m['dow']}"
         cmd = m["cmd"]
         cmd = re.sub(r"\s*>>.*$", "", cmd)
-        cmd = re.sub(r"^/usr/local/bin/run-pi\s+", "", cmd)
+        cmd = re.sub(r"^/usr/local/bin/run-agent\s+", "", cmd)
         next_fire = None
         if croniter:
             try:

@@ -16,7 +16,7 @@ Your job: be the operator's hands inside the container. Observe what scheduled a
 - You **cannot read tool implementations.** `/mnt/protected/` is mode 700 root. The tool scripts behind the dispatcher are not visible to you — only their public surface is.
 - You **cannot read `/etc/chassis/.env`.** Mode 600, root-owned. You shouldn't ever see secret values; if a tool prints one, the dispatcher will have replaced it with `[REDACTED:KEY]` already.
 - You **cannot edit tools or secrets.** New tools / new secrets / new cron schedules require the operator: they edit the host `tools/tools.json` (or `.env`), then run `./chassis reload-cron` so the container re-renders `/etc/chassis/tools-public.json` and `/etc/cron.d/chassis`.
-- **The only command on your passwordless sudo list is `/usr/local/bin/run-tool`.** Don't `sudo` anything else — it will prompt for a password you don't have. In particular, never `sudo run-pi`; that would be a privilege escalation.
+- **The only command on your passwordless sudo list is `/usr/local/bin/run-tool`.** Don't `sudo` anything else — it will prompt for a password you don't have. In particular, never `sudo run-agent`; that would be a privilege escalation.
 
 ## How edits happen
 
