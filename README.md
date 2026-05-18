@@ -78,7 +78,7 @@ Tools are scripts in `tools/` registered in [`tools/tools.json`](tools/tools.jso
 
 | Tool | What it does | Secrets |
 |---|---|---|
-| `web-search` | Tavily web search; returns title/url/content. | `TAVILY_API_KEY` |
+| `web-search` | DuckDuckGo HTML scrape (no key); returns title/url/content. | — |
 | `web-fetch` | Fetch http(s) URL, optional tag-strip, char-capped. | — |
 
 Add a tool: drop a script in `tools/`, append an entry to `tools.json`, run `chassis reload-cron`. See [`tools/README.md`](tools/README.md) for the full contract.

@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # --break-system-packages: Debian 12 marks the system python externally-managed
 # (PEP 668); this image is single-purpose so we accept it.
-RUN pip3 install --break-system-packages --no-cache-dir jsonschema
+RUN pip3 install --break-system-packages --no-cache-dir \
+      jsonschema requests beautifulsoup4
 
 # Pin to match the version the chassis extension is built against
 # (harness/pi-extension/package.json). Bump both together.

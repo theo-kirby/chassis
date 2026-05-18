@@ -58,9 +58,9 @@ CONTAINER = f"{NAME}-chassis"
 PROJECT = f"{NAME}-chassis"
 
 
-def attach_llm_container() -> None:
-    """If LLM_CONTAINER is set in harness/llm.env, attach it to the chassis
-    docker network with alias `llm`. Idempotent.
+def attach_llm_container(chassis_container: str = CONTAINER) -> None:
+    """If LLM_CONTAINER is set in harness/llm.env, attach it to the given
+    chassis container's docker network with alias `llm`. Idempotent.
     """
     name = ""
     if LLM_ENV_FILE.exists():
@@ -72,7 +72,7 @@ def attach_llm_container() -> None:
     if not name:
         return
     inspect = run(
-        ["docker", "inspect", CONTAINER, "--format",
+        ["docker", "inspect", chassis_container, "--format",
          "{{range $n, $_ := .NetworkSettings.Networks}}{{$n}}\n{{end}}"],
         capture_output=True, text=True,
     )
@@ -83,6 +83,35 @@ def attach_llm_container() -> None:
         return
     run(
         ["docker", "network", "connect", "--alias", "llm", networks[0], name],
+        capture_output=True, text=True,
+    )
+
+
+def detach_llm_container(chassis_container: str) -> None:
+    """Reverse of attach_llm_container. Without this, `compose down -v` can't
+    remove the network because vllm-server is still an active endpoint on it.
+    """
+    name = ""
+    if LLM_ENV_FILE.exists():
+        for line in LLM_ENV_FILE.read_text().splitlines():
+            s = line.strip()
+            if s.startswith("LLM_CONTAINER="):
+                name = s.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    if not name:
+        return
+    inspect = run(
+        ["docker", "inspect", chassis_container, "--format",
+         "{{range $n, $_ := .NetworkSettings.Networks}}{{$n}}\n{{end}}"],
+        capture_output=True, text=True,
+    )
+    if inspect.returncode != 0:
+        return
+    networks = [n for n in inspect.stdout.strip().splitlines() if n]
+    if not networks:
+        return
+    run(
+        ["docker", "network", "disconnect", networks[0], name],
         capture_output=True, text=True,
     )
 
@@ -249,6 +278,8 @@ def cmd_test(args: argparse.Namespace) -> int:
         if rc != 0:
             return rc
 
+        attach_llm_container(test_container)
+
         print(f"[{test_id}] waiting for entrypoint")
         ready = False
         for _ in range(60):
@@ -288,6 +319,7 @@ def cmd_test(args: argparse.Namespace) -> int:
         return result.returncode
     finally:
         print(f"[{test_id}] teardown")
+        detach_llm_container(test_container)
         compose_t(["down", "-v", "--remove-orphans"], capture_output=True)
         try:
             os.unlink(override_path)
