@@ -2,20 +2,19 @@
   "tools": [
     {
       "name": "web-search",
-      "description": "Search the web via Tavily. Returns up to max_results entries of {title, url, content (≤1500 chars)}.",
+      "description": "Search the web via DuckDuckGo (no API key). Returns up to max_results entries of {title, url, content (≤1500 chars)}. May fail with a bot-detection error from heavily-used server IPs.",
       "script": "web-search",
       "runner": "python3",
       "args_schema": {
         "type": "object",
         "properties": {
-          "query":        {"type": "string", "minLength": 1},
-          "max_results":  {"type": "integer", "minimum": 1, "maximum": 10},
-          "search_depth": {"type": "string", "enum": ["basic", "advanced"]}
+          "query":       {"type": "string", "minLength": 1},
+          "max_results": {"type": "integer", "minimum": 1, "maximum": 10}
         },
         "required": ["query"],
         "additionalProperties": false
       },
-      "secrets": ["TAVILY_API_KEY"]
+      "secrets": []
     },
     {
       "name": "web-fetch",

@@ -1,46 +1,113 @@
 #!/usr/bin/env python3
-"""Tavily search. args: {query, max_results?, search_depth?}"""
+"""DuckDuckGo HTML search. args: {query, max_results?}.
+
+No API key. Scrapes html.duckduckgo.com/html/ via a requests Session
+(seeded by a homepage GET to pick up cookies) and parses results with
+BeautifulSoup. Returns [{title, url, content}, ...].
+"""
 
 import json
-import os
+import re
 import sys
-import urllib.error
-import urllib.request
+import urllib.parse
 
-args = json.loads(sys.argv[1])
-api_key = os.environ.get("TAVILY_API_KEY")
-if not api_key:
-    print("TAVILY_API_KEY not set", file=sys.stderr)
-    sys.exit(1)
+import requests
+from bs4 import BeautifulSoup
 
-payload = json.dumps({
-    "api_key": api_key,
-    "query": args["query"],
-    "max_results": args.get("max_results", 5),
-    "search_depth": args.get("search_depth", "basic"),
-}).encode()
-
-req = urllib.request.Request(
-    "https://api.tavily.com/search",
-    data=payload,
-    headers={"Content-Type": "application/json"},
+HOME = "https://duckduckgo.com/"
+ENDPOINT = "https://html.duckduckgo.com/html/"
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
-try:
-    with urllib.request.urlopen(req, timeout=30) as r:
-        result = json.loads(r.read())
-except urllib.error.HTTPError as e:
-    print(f"tavily {e.code}: {e.read().decode(errors='replace')}", file=sys.stderr)
-    sys.exit(1)
-except Exception as e:
-    print(f"tavily error: {e}", file=sys.stderr)
-    sys.exit(1)
+SNIPPET_CAP = 1500
 
-out = [
-    {
-        "title":   item.get("title", ""),
-        "url":     item.get("url", ""),
-        "content": item.get("content", "")[:1500],
-    }
-    for item in result.get("results", [])
-]
-print(json.dumps(out, indent=2))
+
+def unwrap_redirect(href: str) -> str:
+    """DDG wraps result URLs in //duckduckgo.com/l/?uddg=<encoded>&rut=...
+    Unwrap so callers see the real target."""
+    if not href:
+        return href
+    if href.startswith("//"):
+        href = "https:" + href
+    parsed = urllib.parse.urlparse(href)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.rstrip("/") == "/l":
+        target = urllib.parse.parse_qs(parsed.query).get("uddg", [None])[0]
+        if target:
+            return urllib.parse.unquote(target)
+    return href
+
+
+def search(query: str, max_results: int, timeout: int) -> list[dict]:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    )
+    # Seed cookies with a homepage GET — DDG's anomaly detector is more
+    # forgiving toward sessions that look like real browser flows.
+    session.get(HOME, timeout=timeout)
+    resp = session.post(
+        ENDPOINT,
+        data={"q": query, "kl": "us-en"},
+        headers={"Referer": HOME},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    body = resp.text
+    if "anomaly-modal" in body or "/anomaly.js" in body:
+        raise RuntimeError(
+            "DuckDuckGo blocked this request with a bot-detection challenge. "
+            "DDG aggressively rate-limits server IPs; retry later or run the "
+            "chassis behind a residential egress."
+        )
+
+    soup = BeautifulSoup(body, "html.parser")
+    results: list[dict] = []
+    for div in soup.select("div.result"):
+        classes = div.get("class") or []
+        if "result--ad" in classes:
+            continue
+        a = div.select_one("a.result__a")
+        if not a:
+            continue
+        snippet_el = div.select_one("a.result__snippet, .result__snippet")
+        snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+        results.append(
+            {
+                "title": a.get_text(" ", strip=True),
+                "url": unwrap_redirect(a.get("href", "")),
+                "content": re.sub(r"\s+", " ", snippet)[:SNIPPET_CAP],
+            }
+        )
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def main() -> int:
+    args = json.loads(sys.argv[1])
+    query = args["query"]
+    max_results = int(args.get("max_results", 5))
+    try:
+        results = search(query, max_results, timeout=20)
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        body = (e.response.text or "")[:500] if e.response is not None else ""
+        print(f"ddg http {code}: {body}", file=sys.stderr)
+        return 1
+    except requests.RequestException as e:
+        print(f"ddg request error: {e}", file=sys.stderr)
+        return 1
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(json.dumps(results, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
