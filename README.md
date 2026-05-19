@@ -31,8 +31,8 @@ a task is a directory containing an instruction prompt, and a schedule:
 
 These three base abstractions allow for an extremely general surface for configuring a large number of multi-agent systems.
 
-![dashboard](docs/dashboard.png)
-> * note the data above is not a real agent system - just a fanciful imagination by claude of what it thinks one would look like.
+![architecture](docs/architecture.png)
+> * a simplified visual description of a chassis based agent system
 
 Each chassis is one container holding a fleet of cron-driven agents. Secrets live in a root-only file and only land in validated tool calls; never in the agent's address space. The LLM runtime and source is pluggable; the default is [Pi](https://github.com/earendil-works/pi-coding-agent), swappable per branch (see [Branches](#branches)). Per-branch namespacing lets several chassis run side by side on one host; multi-tenant chassis operation is a core feature.
 
@@ -48,6 +48,9 @@ An agent is a directory:
     INSTRUCTIONS.md  ← prompt for this run
     cron             ← single line, e.g. `0 7 * * *`
 ```
+
+![dashboard](docs/dashboard.png)
+> * note the data above is not a real agent system - just a fanciful imagination by claude of what it thinks one would look like.
 
 The seeded `manager` agent can edit, observe, and launch other agents from inside the container. The onboarding wizard (`chassis setup`) scaffolds new agents for you.
 
