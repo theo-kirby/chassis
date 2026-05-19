@@ -24,6 +24,12 @@ def main() -> int:
     key   = p.get("apiKey", "")
     kind  = p.get("api", "openai-completions")
 
+    headers = p.get("headers", {})
+    missing = [h for h in ("X-Chassis-Agent", "X-Chassis-Task") if h not in headers]
+    if missing:
+        print(f"ping: models.json providers.llm.headers missing {missing}", file=sys.stderr)
+        return 2
+
     print(f"endpoint : {base}")
     print(f"model    : {model}")
     print(f"api kind : {kind}")

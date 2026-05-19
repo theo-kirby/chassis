@@ -147,6 +147,10 @@ cfg = {"providers": {"llm": {
     "api":     os.environ.get("LLM_API_KIND", "openai-completions"),
     "apiKey":  os.environ.get("LLM_API_KEY") or "unused",
     "compat":  {"supportsDeveloperRole": False, "supportsReasoningEffort": False},
+    "headers": {
+        "X-Chassis-Agent": "CHASSIS_AGENT",
+        "X-Chassis-Task":  "!printf %s \"${CHASSIS_TASK:-interactive}\"",
+    },
     "models": [{
         "id":            os.environ.get("LLM_MODEL_ID", ""),
         "contextWindow": int(os.environ.get("LLM_CONTEXT_WINDOW", "8192")),
