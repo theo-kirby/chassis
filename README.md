@@ -49,9 +49,6 @@ An agent is a directory:
     cron             ← single line, e.g. `0 7 * * *`
 ```
 
-![dashboard](docs/dashboard.png)
-> * note the data above is not a real agent system - just a fanciful imagination by claude of what it thinks one would look like.
-
 The seeded `manager` agent can edit, observe, and launch other agents from inside the container. The onboarding wizard (`chassis setup`) scaffolds new agents for you.
 
 ## Quick start
@@ -73,7 +70,7 @@ Skip the wizard with `chassis run manager`: the manager can scaffold agents from
 - **Two users.** `root` owns the runtime, tools, secrets, and cron. `agent` (UID 2000) owns its home and every agent definition, on a persistent volume.
 - **Privileged tool dispatcher.** Agents call `sudo run-tool <name> '<json-args>'`. The dispatcher validates args against a JSON schema and injects only the declared secrets into the tool's child env. See [`tools/README.md`](tools/README.md) for the contract.
 - **Audit log.** Every dispatcher call appends to `/var/log/chassis/run-tool.jsonl` with secrets redacted from stdout/stderr.
-- **Dashboard.** [`dashboard/`](dashboard/) auto-discovers running chassis on the host and surfaces cron schedules, last runs, audit tail, and a drill-in for individual sessions.
+- **Dashboard.** [`dashboard/`](dashboard/) is a single-chassis web monitor: cron schedules, last agent runs, audit tail, and a drill-in for individual sessions. Auto-picks the chassis when one is running; pass `--chassis <name>` for multiples.
 
 ## Tools
 

@@ -8,11 +8,11 @@
 # ]
 # ///
 """
-chassis dashboard — local web monitor for chassis containers.
+chassis dashboard — local web monitor for a single chassis container.
 
-Auto-discovers any container whose docker-compose project name ends with
-"-chassis" and exposes a single auto-refreshing page at http://127.0.0.1:8765
-showing, per chassis:
+Targets one container whose docker-compose project name ends with
+"-chassis" and exposes an auto-refreshing page at http://127.0.0.1:8765
+showing:
   - container status, uptime, restart count
   - CPU / memory usage
   - parsed cron schedule with next-fire times
@@ -20,6 +20,9 @@ showing, per chassis:
   - tail of the dispatcher audit log (deny/error highlighted)
 
 Click an audit row or agent row to drill in.
+
+Picks the chassis automatically when exactly one is running; pass
+`--chassis <name>` when multiple are running.
 
 See dashboard/README.md for setup.
 """
@@ -49,6 +52,10 @@ CRON_FILE = "/etc/cron.d/chassis"
 # Anything else returns 400 — the dashboard isn't a generic shell.
 ALLOWED_FILE_PREFIXES = ("/home/agent/.pi/", "/var/log/chassis/")
 FILE_MAX_BYTES = 200_000
+
+# Override target; set from --chassis. None = auto-pick when exactly one
+# chassis container is running.
+CHASSIS_NAME: str | None = None
 
 _SAFE_NAME = re.compile(r"^[a-zA-Z0-9_.-]+$")
 
@@ -110,21 +117,18 @@ async def docker_inspect(name: str) -> dict:
     }
 
 
-async def docker_stats_all() -> dict[str, dict]:
+async def docker_stats(name: str) -> dict:
     rc, out, _ = await sh(
-        "docker", "stats", "--no-stream", "--format",
-        "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}",
+        "docker", "stats", name, "--no-stream", "--format",
+        "{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}",
         timeout=10.0,
     )
-    res: dict[str, dict] = {}
     if rc != 0:
-        return res
-    for line in out.strip().splitlines():
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
-        res[parts[0]] = {"cpu": parts[1], "mem": parts[2], "mem_pct": parts[3]}
-    return res
+        return {}
+    parts = out.strip().split("\t")
+    if len(parts) < 3:
+        return {}
+    return {"cpu": parts[0], "mem": parts[1], "mem_pct": parts[2]}
 
 
 async def exec_in(container: str, *cmd: str, user: str = "agent", timeout: float = 4.0) -> str:
@@ -134,7 +138,7 @@ async def exec_in(container: str, *cmd: str, user: str = "agent", timeout: float
     return out if rc == 0 else ""
 
 
-async def tail_audit(container: str, n: int = 20) -> list[dict]:
+async def tail_audit(container: str, n: int = 50) -> list[dict]:
     raw = await exec_in(container, "sh", "-c", f"tail -n {n} {AUDIT_LOG} 2>/dev/null")
     entries: list[dict] = []
     for line in raw.strip().splitlines():
@@ -226,20 +230,23 @@ async def cron_jobs(container: str) -> list[dict]:
     return jobs
 
 
-async def chassis_snapshot(meta: dict, stats: dict[str, dict]) -> dict:
+async def chassis_snapshot(meta: dict) -> dict:
     name = meta["name"]
-    inspect = await docker_inspect(name)
+    inspect, stats = await asyncio.gather(
+        docker_inspect(name),
+        docker_stats(name),
+    )
     snap: dict = {
         "name": name,
         "project": meta["project"],
         "status_line": meta["status_line"],
-        "stats": stats.get(name, {}),
+        "stats": stats,
         **inspect,
     }
     if not inspect.get("running"):
         return snap
     audit, agents, jobs = await asyncio.gather(
-        tail_audit(name, 25),
+        tail_audit(name, 50),
         list_agents(name),
         cron_jobs(name),
     )
@@ -250,6 +257,23 @@ async def chassis_snapshot(meta: dict, stats: dict[str, dict]) -> dict:
     return snap
 
 
+async def resolve_chassis() -> tuple[dict | None, str | None]:
+    """Return (meta, error). meta is the chassis to render; error is a
+    human-readable message when we can't pick one."""
+    chassis = await docker_ps_chassis()
+    if CHASSIS_NAME:
+        meta = next((m for m in chassis if m["name"] == CHASSIS_NAME), None)
+        if not meta:
+            return None, f"chassis '{CHASSIS_NAME}' not found"
+        return meta, None
+    if not chassis:
+        return None, "no -chassis containers found"
+    if len(chassis) > 1:
+        names = ", ".join(c["name"] for c in chassis)
+        return None, f"multiple chassis found ({names}); pass --chassis <name>"
+    return chassis[0], None
+
+
 # ---------- app -----------------------------------------------------------
 
 app = FastAPI(title="chassis dashboard")
@@ -257,12 +281,17 @@ app = FastAPI(title="chassis dashboard")
 
 @app.get("/api/state")
 async def api_state():
-    chassis = await docker_ps_chassis()
-    stats = await docker_stats_all()
-    snapshots = await asyncio.gather(*(chassis_snapshot(m, stats) for m in chassis))
+    meta, err = await resolve_chassis()
+    if err or meta is None:
+        return JSONResponse({
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "error": err,
+            "chassis": None,
+        })
+    snap = await chassis_snapshot(meta)
     return JSONResponse({
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "chassis": snapshots,
+        "chassis": snap,
     })
 
 
@@ -325,49 +354,37 @@ INDEX_HTML = r"""<!doctype html>
   .topbar .brand { display:flex; align-items:center; gap:8px; font-size:15px; font-weight:600; letter-spacing:.3px; }
   .topbar .brand .car { font-size:18px; filter:saturate(1.2); }
   .topbar .brand .name { color:#c9d1d9; }
+  .topbar .brand .chassis { color:#8b949e; font-weight:500; }
   .topbar .config { display:flex; gap:14px; align-items:center; color:#c9d1d9; font-size:11.5px; padding-left:8px; border-left:1px solid #21262d; }
+  .topbar .config:empty { display:none; }
   .topbar .config .cfg { display:flex; align-items:baseline; gap:6px; }
   .topbar .config .cfg-k { color:#6e7681; text-transform:uppercase; font-size:10px; letter-spacing:.6px; }
-  .topbar .stats-inline { display:flex; gap:14px; align-items:center; color:#8b949e; font-size:11.5px; flex:1; padding-left:8px; border-left:1px solid #21262d; }
-  .topbar .stats-inline .item { display:flex; align-items:center; gap:5px; }
-  .topbar .stats-inline .item .num { color:#c9d1d9; font-weight:600; }
-  .topbar .stats-inline .item .dot { width:6px; height:6px; }
-  .topbar .stats-inline .item.bad .num { color:#f85149; }
-  .topbar .age { color:#6e7681; font-size:11px; }
-  .page { padding:14px; }
+  .topbar .age { color:#6e7681; font-size:11px; margin-left:auto; }
+  .page { padding:14px; max-width:1400px; margin:0 auto; box-sizing:border-box; }
   .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin-bottom:14px; }
-  .stat { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:8px 10px; display:flex; flex-direction:column; gap:4px; min-height:74px; }
+  .stat { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:10px 12px; display:flex; flex-direction:column; gap:4px; min-height:80px; }
   .stat .label { color:#6e7681; font-size:10px; text-transform:uppercase; letter-spacing:.6px; }
-  .stat .value { font-size:18px; font-weight:600; color:#c9d1d9; line-height:1.15; }
-  .stat .sub { color:#6e7681; font-size:10.5px; }
+  .stat .value { font-size:20px; font-weight:600; color:#c9d1d9; line-height:1.15; }
+  .stat .value .sub { color:#6e7681; font-size:11px; font-weight:400; }
   .stat svg.gauge { display:block; width:100%; height:24px; margin-top:auto; }
-  .bar { height:6px; background:#21262d; border-radius:3px; overflow:hidden; display:flex; }
-  .bar > span { display:block; height:100%; }
-  .bar .up { background:#3fb950; }
-  .bar .down { background:#f85149; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fill,300px); gap:10px; justify-content:start; }
-  .card { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:9px 11px; aspect-ratio:1/1; overflow-y:auto; display:flex; flex-direction:column; box-sizing:border-box; }
-  .card::-webkit-scrollbar { width:6px; }
-  .card::-webkit-scrollbar-thumb { background:#30363d; border-radius:3px; }
-  .card.down { opacity:.55; }
-  .card h2 { font-size:13px; margin:0 0 4px; display:flex; align-items:center; gap:7px; font-weight:600; }
+  .blocks { display:grid; grid-template-columns:1fr; gap:12px; }
+  .block { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:12px 14px; }
+  .block h3 { margin:0 0 8px; font-size:12px; font-weight:600; color:#6e7681; text-transform:uppercase; letter-spacing:.6px; }
   .dot { width:8px; height:8px; border-radius:50%; display:inline-block; flex:none; }
   .dot.up { background:#3fb950; }
   .dot.down { background:#f85149; }
-  .meta { color:#8b949e; font-size:11px; margin-bottom:6px; }
-  section { margin-top:6px; }
-  .label { color:#6e7681; font-size:10px; text-transform:uppercase; letter-spacing:.6px; margin-bottom:2px; }
-  .line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:1px 0; }
   .line.deny { color:#f85149; }
   .ts { color:#6e7681; display:inline-block; min-width:5.5em; }
-  table { width:100%; border-collapse:collapse; font-size:11.5px; }
-  td { padding:1px 6px 1px 0; vertical-align:top; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  td { padding:2px 10px 2px 0; vertical-align:top; }
   td.k { color:#8b949e; white-space:nowrap; }
-  .empty { color:#6e7681; font-style:italic; font-size:11.5px; }
+  .empty { color:#6e7681; font-style:italic; font-size:11.5px; padding:4px 0; }
   code { background:#21262d; padding:1px 5px; border-radius:3px; font-size:11px; }
   .pill { display:inline-block; padding:1px 6px; border-radius:10px; font-size:10px; background:#21262d; color:#8b949e; }
   .clickable { cursor:pointer; }
   .clickable:hover { background:#1f2630; }
+  .error-page { padding:40px; color:#f85149; font-size:13px; }
   .modal { position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center; }
   .modal[hidden] { display:none; }
   .modal-backdrop { position:absolute; inset:0; background:rgba(0,0,0,.7); }
@@ -390,15 +407,16 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
 <div class="topbar">
-  <div class="brand"><span class="car">🏎️</span><span class="name">chassis</span></div>
+  <div class="brand">
+    <span class="car">🏎️</span>
+    <span class="name">chassis</span>
+    <span class="chassis" id="chassis-name"></span>
+    <span class="pill" id="chassis-pill" hidden></span>
+  </div>
   <div class="config" id="topconfig"></div>
-  <div class="stats-inline" id="topstats"></div>
   <div class="age" id="age">loading…</div>
 </div>
-<div class="page">
-  <div class="stats" id="stats"></div>
-  <div class="grid" id="grid"></div>
-</div>
+<div class="page" id="page"></div>
 <div id="modal" class="modal" hidden>
   <div class="modal-backdrop"></div>
   <div class="modal-body">
@@ -453,65 +471,13 @@ function gauge(val, max){
   }
   return `<svg class="gauge" viewBox="0 0 ${GAUGE_W} ${GAUGE_H}" preserveAspectRatio="none">${rects}</svg>`;
 }
-function renderTopStats(data){
-  const cs=data.chassis||[];
-  const up=cs.filter(c=>c.running).length, total=cs.length;
-  const agents=cs.reduce((a,c)=>a+((c.agents||[]).length),0);
-  const hourAgo=Date.now()-3600*1000;
-  let calls=0, bad=0;
-  for(const c of cs) for(const e of (c.audit||[])){
-    const t=Date.parse(e.ts); if(!(t&&t>=hourAgo)) continue;
-    calls++;
-    if(e.status==="denied"||(e.exit&&e.exit!==0)) bad++;
-  }
-  const allUp=total>0&&up===total;
 
-  // Runtime config — surface from the first chassis that reports any of the
-  // known fields. When chassis disagree the operator should look at the
-  // individual cards, so the top bar keeps a single representative value
-  // rather than averaging or "mixed".
-  const CFG_FIELDS = ["harness", "model", "source"];
-  const cfgSrc = cs.find(c => CFG_FIELDS.some(k => c[k])) || {};
-  const cfgItems = CFG_FIELDS
-    .filter(k => cfgSrc[k])
-    .map(k => `<div class="cfg"><span class="cfg-k">${k}</span><span>${escape(cfgSrc[k])}</span></div>`);
-  document.getElementById("topconfig").innerHTML = cfgItems.join("");
-
-  document.getElementById("topstats").innerHTML=`
-    <div class="item"><span class="dot ${allUp?"up":"down"}"></span><span class="num">${up}/${total}</span> chassis</div>
-    <div class="item"><span class="num">${agents}</span> agents</div>
-    <div class="item ${bad>0?"bad":""}"><span class="num">${calls}</span> calls/hr${bad?` <span class="num">· ${bad} bad</span>`:""}</div>`;
-}
 // Gauge scales: chosen so a typical-load chassis sits ~40-60%, leaving room
 // for the gradient to communicate "headroom" vs "approaching limit."
 const GAUGE_MAX_CPU   = 400;   // 4 fully-saturated cores
 const GAUGE_MAX_MEM   = 100;   // % of host
 const GAUGE_MAX_TOOLS = 50;    // calls/hr is "busy"
-function renderStats(data){
-  const cs=data.chassis||[];
-  const cpuTotal=cs.reduce((a,c)=>a+parseNum(c.stats&&c.stats.cpu),0);
-  const memTotal=cs.reduce((a,c)=>a+parseNum(c.stats&&c.stats.mem_pct),0);
-  const hourAgo=Date.now()-3600*1000;
-  const toolsHour=cs.reduce((a,c)=>a+((c.audit||[]).filter(e=>{const t=Date.parse(e.ts);return t&&t>=hourAgo;}).length),0);
-  const denyHour=cs.reduce((a,c)=>a+((c.audit||[]).filter(e=>{const t=Date.parse(e.ts);if(!(t&&t>=hourAgo))return false;return e.status==="denied"||(e.exit&&e.exit!==0);}).length),0);
-  const el=document.getElementById("stats");
-  el.innerHTML=`
-    <div class="stat">
-      <div class="label">cpu total</div>
-      <div class="value">${cpuTotal.toFixed(1)}<span class="sub">%</span></div>
-      ${gauge(cpuTotal, GAUGE_MAX_CPU)}
-    </div>
-    <div class="stat">
-      <div class="label">memory total</div>
-      <div class="value">${memTotal.toFixed(1)}<span class="sub">% host</span></div>
-      ${gauge(memTotal, GAUGE_MAX_MEM)}
-    </div>
-    <div class="stat">
-      <div class="label">tool calls (1h)</div>
-      <div class="value">${toolsHour}${denyHour?` <span class="sub">· ${denyHour} bad</span>`:""}</div>
-      ${gauge(toolsHour, GAUGE_MAX_TOOLS)}
-    </div>`;
-}
+
 function relTime(iso){
   if(!iso) return "—";
   const d=new Date(iso); if(isNaN(d)) return iso;
@@ -524,63 +490,96 @@ function relTime(iso){
   else v=Math.floor(a/86400)+"d";
   return diff>=0?`${v} ago`:`in ${v}`;
 }
-function renderAudit(audit){
-  if(!audit||!audit.length) return '<div class="empty">no audit entries</div>';
-  return audit.slice(0,4).map(e=>{
-    const bad=e.status==="denied"||(e.exit&&e.exit!==0);
-    const note=bad?` ✗ ${escape(e.reason||"exit "+e.exit)}`:"";
-    return `<div class="line clickable ${bad?"deny":""}" data-audit="${escape(JSON.stringify(e))}"><span class="ts">${escape(relTime(e.ts))}</span> ${escape(e.tool)}${note}</div>`;
-  }).join("");
+
+function renderTopBar(c){
+  document.getElementById("chassis-name").textContent = c ? "· " + c.name : "";
+  const pill = document.getElementById("chassis-pill");
+  if (c) { pill.textContent = c.status || "unknown"; pill.hidden = false; }
+  else { pill.hidden = true; }
+  const CFG_FIELDS = ["harness", "model", "source"];
+  const cfgItems = c ? CFG_FIELDS
+    .filter(k => c[k])
+    .map(k => `<div class="cfg"><span class="cfg-k">${k}</span><span>${escape(c[k])}</span></div>`) : [];
+  document.getElementById("topconfig").innerHTML = cfgItems.join("");
 }
-function renderAgents(chassis,agents){
-  if(!agents||!agents.length) return '<div class="empty">no agents</div>';
-  return '<table>'+agents.map(a=>{
-    const r=a.last_run;
-    const when=r?escape(relTime(new Date(r.mtime*1000).toISOString())):'<span class="empty">never</span>';
-    const task=r?(r.task?`<code>${escape(r.task)}</code>`:'<span class="empty">interactive</span>'):'';
-    return `<tr class="clickable" data-chassis="${escape(chassis)}" data-agent="${escape(a.name)}"><td class="k">${escape(a.name)}</td><td>${task}</td><td>${when}</td></tr>`;
-  }).join("")+'</table>';
-}
-function renderCron(jobs){
-  if(!jobs||!jobs.length) return '<div class="empty">no cron jobs</div>';
-  return '<table>'+jobs.map(j=>{
-    const next=j.next?escape(relTime(j.next)):'<span class="empty">—</span>';
-    return `<tr><td class="k">${escape(j.schedule)}</td><td>${escape(j.command)}</td><td>${next}</td></tr>`;
-  }).join("")+'</table>';
-}
-function renderChassis(c){
-  const up=c.running;
-  const stats=c.stats||{};
-  const statBits=up&&stats.cpu?` · cpu ${escape(stats.cpu)} · mem ${escape(stats.mem_pct||stats.mem||"")}`:"";
+
+function renderStats(c){
+  const stats = c.stats || {};
+  const cpu = parseNum(stats.cpu);
+  const mem = parseNum(stats.mem_pct);
+  const hourAgo = Date.now() - 3600*1000;
+  const audit = c.audit || [];
+  const toolsHour = audit.filter(e => { const t = Date.parse(e.ts); return t && t >= hourAgo; }).length;
+  const denyHour = audit.filter(e => {
+    const t = Date.parse(e.ts);
+    if (!(t && t >= hourAgo)) return false;
+    return e.status === "denied" || (e.exit && e.exit !== 0);
+  }).length;
   return `
-    <div class="card ${up?"":"down"}">
-      <h2><span class="dot ${up?"up":"down"}"></span>${escape(c.name)} <span class="pill">${escape(c.status||"unknown")}</span></h2>
-      <div class="meta">${escape(c.status_line||"")} · restarts ${c.restart_count??0}${statBits}</div>
-      ${up?`
-        <section><div class="label">agents</div>${renderAgents(c.name,c.agents)}</section>
-        <section><div class="label">cron</div>${renderCron(c.cron)}</section>
-        <section><div class="label">recent tools</div>${renderAudit(c.audit)}</section>
-      `:""}
+    <div class="stats">
+      <div class="stat">
+        <div class="label">cpu</div>
+        <div class="value">${cpu.toFixed(1)}<span class="sub"> %</span></div>
+        ${gauge(cpu, GAUGE_MAX_CPU)}
+      </div>
+      <div class="stat">
+        <div class="label">memory</div>
+        <div class="value">${mem.toFixed(1)}<span class="sub"> % host</span></div>
+        ${gauge(mem, GAUGE_MAX_MEM)}
+      </div>
+      <div class="stat">
+        <div class="label">tool calls (1h)</div>
+        <div class="value">${toolsHour}${denyHour ? ` <span class="sub">· ${denyHour} bad</span>` : ""}</div>
+        ${gauge(toolsHour, GAUGE_MAX_TOOLS)}
+      </div>
+      <div class="stat">
+        <div class="label">uptime</div>
+        <div class="value">${escape(c.status_line || "")}</div>
+        <div class="sub" style="color:#6e7681;font-size:10.5px">restarts ${c.restart_count ?? 0}</div>
+      </div>
     </div>`;
 }
-let lastN=0;
-function layoutCards(n){
-  const grid=document.getElementById("grid");
-  if(!grid) return;
-  if(!n){ grid.style.gridTemplateColumns=""; return; }
-  const gap=10, minSize=180, maxSize=420;
-  const W=grid.clientWidth;
-  const top=grid.getBoundingClientRect().top;
-  const H=Math.max(window.innerHeight-top-16,200);
-  let best={size:0,cols:1};
-  for(let cols=1;cols<=n;cols++){
-    const rows=Math.ceil(n/cols);
-    const s=Math.min((W-gap*(cols-1))/cols,(H-gap*(rows-1))/rows);
-    if(s>best.size) best={size:s,cols};
-  }
-  const size=Math.max(minSize,Math.min(maxSize,Math.floor(best.size)));
-  grid.style.gridTemplateColumns=`repeat(${best.cols}, ${size}px)`;
+
+function renderAgents(chassis, agents){
+  if (!agents || !agents.length) return '<div class="empty">no agents</div>';
+  return '<table>' + agents.map(a => {
+    const r = a.last_run;
+    const when = r ? escape(relTime(new Date(r.mtime*1000).toISOString())) : '<span class="empty">never</span>';
+    const task = r ? (r.task ? `<code>${escape(r.task)}</code>` : '<span class="empty">interactive</span>') : '';
+    return `<tr class="clickable" data-chassis="${escape(chassis)}" data-agent="${escape(a.name)}"><td class="k">${escape(a.name)}</td><td>${task}</td><td>${when}</td></tr>`;
+  }).join("") + '</table>';
 }
+
+function renderCron(jobs){
+  if (!jobs || !jobs.length) return '<div class="empty">no cron jobs</div>';
+  return '<table>' + jobs.map(j => {
+    const next = j.next ? escape(relTime(j.next)) : '<span class="empty">—</span>';
+    return `<tr><td class="k">${escape(j.schedule)}</td><td>${escape(j.command)}</td><td>${next}</td></tr>`;
+  }).join("") + '</table>';
+}
+
+function renderAudit(audit){
+  if (!audit || !audit.length) return '<div class="empty">no audit entries</div>';
+  return audit.map(e => {
+    const bad = e.status === "denied" || (e.exit && e.exit !== 0);
+    const note = bad ? ` ✗ ${escape(e.reason || "exit " + e.exit)}` : "";
+    return `<div class="line clickable ${bad ? "deny" : ""}" data-audit="${escape(JSON.stringify(e))}"><span class="ts">${escape(relTime(e.ts))}</span> ${escape(e.tool)}${note}</div>`;
+  }).join("");
+}
+
+function renderPage(c){
+  if (!c.running){
+    return `${renderStats(c)}<div class="block"><div class="empty">chassis is not running</div></div>`;
+  }
+  return `
+    ${renderStats(c)}
+    <div class="blocks">
+      <div class="block"><h3>agents</h3>${renderAgents(c.name, c.agents)}</div>
+      <div class="block"><h3>cron</h3>${renderCron(c.cron)}</div>
+      <div class="block"><h3>recent tools</h3>${renderAudit(c.audit)}</div>
+    </div>`;
+}
+
 // --- modal ---------------------------------------------------------------
 function openModal(title,html){
   document.querySelector('.modal-title').textContent=title;
@@ -644,19 +643,20 @@ async function tick(){
   try{
     const r=await fetch("/api/state");
     const data=await r.json();
-    renderTopStats(data);
-    renderStats(data);
-    const g=document.getElementById("grid");
-    const n=data.chassis.length;
-    g.innerHTML=n?data.chassis.map(renderChassis).join(""):'<div class="empty">no chassis containers found</div>';
-    lastN=n;
-    layoutCards(n);
+    const page=document.getElementById("page");
+    if(data.error || !data.chassis){
+      renderTopBar(null);
+      page.innerHTML=`<div class="error-page">${escape(data.error || "no chassis")}</div>`;
+    }else{
+      renderTopBar(data.chassis);
+      document.title = `chassis · ${data.chassis.name}`;
+      page.innerHTML = renderPage(data.chassis);
+    }
     document.getElementById("age").textContent="updated "+relTime(data.generated_at);
   }catch(e){
     document.getElementById("age").textContent="fetch error: "+e.message;
   }
 }
-window.addEventListener("resize",()=>layoutCards(lastN));
 tick();
 setInterval(tick,3000);
 </script>
@@ -674,10 +674,13 @@ async def index() -> str:
 
 
 def main() -> None:
+    global CHASSIS_NAME
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--chassis", default=None, help="Container name to monitor. Defaults to the only chassis container running.")
     args = ap.parse_args()
+    CHASSIS_NAME = args.chassis
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

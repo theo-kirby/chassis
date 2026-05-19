@@ -1,7 +1,6 @@
 # dashboard
 
-Local web monitor for chassis containers. Auto-discovers any container whose
-docker-compose project name ends with `-chassis` and shows status, CPU/mem,
+Local web monitor for a single chassis container. Shows status, CPU/mem,
 cron schedule + next-fire times, last agent runs, and the dispatcher audit
 log on a single auto-refreshing page.
 
@@ -9,8 +8,8 @@ Click an audit row to see the full record. Click an agent row to drill into
 its recent runs and open the Pi session file or per-run log.
 
 Read-only — it calls `docker ps`, `docker stats`, `docker exec` against
-already-running chassis. There is no auth and no TLS; do not expose it on
-the public internet.
+an already-running chassis. There is no auth and no TLS; do not expose it
+on the public internet.
 
 ## Run
 
@@ -19,8 +18,14 @@ so [uv](https://docs.astral.sh/uv/) handles them automatically:
 
 ```sh
 ./app.py                         # http://127.0.0.1:8765
+./app.py --chassis my-chassis    # explicit target
 ./app.py --host 0.0.0.0 --port 9000
 ```
+
+The chassis is auto-picked when exactly one container with a
+`-chassis`-suffixed compose project is running. If you have multiple,
+pass `--chassis <container-name>` (run a separate instance per chassis
+on different ports).
 
 If you don't have uv, install the three deps manually and run with python:
 
