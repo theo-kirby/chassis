@@ -1,11 +1,62 @@
 #!/usr/bin/env bash
 #
-# run-agent — drop privileges (when invoked as root) and exec the underlying
+# run-agent — drop privileges (when invoked as root) and run the underlying
 # harness CLI (currently `pi`) with the chassis extension loaded. With a task,
-# runs one-shot via --print using the task's INSTRUCTIONS.md as prompt;
-# without, runs interactive (TUI).
+# runs one-shot via --print using the task's INSTRUCTIONS.md as prompt, then
+# fires any sibling trigger files that point at this (agent, task). Without
+# a task, execs into the interactive TUI (no trigger fan-out).
 
 set -euo pipefail
+
+LOG_DIR=/var/log/chassis
+TRIGGER_LOG="$LOG_DIR/triggers.log"
+
+# After a task finishes, walk /home/agent/<a>/<t>/trigger and fire any task
+# whose trigger points at the just-completed (agent, task). Grammar is one
+# line, mirroring the cron file:
+#   after      <agent>/<task>   # fires on any exit
+#   on_success <agent>/<task>   # fires on exit 0
+#   on_failure <agent>/<task>   # fires on non-zero exit
+# Matches are detached with setsid so this wrapper exits promptly. Cycles
+# (A->B->A) are intentional — they enable feedback loops. The operator can
+# pkill -f run-agent if a loop misbehaves.
+fire_triggers() {
+    local src_agent="$1" src_task="$2" rc="$3"
+    local accept
+    if (( rc == 0 )); then
+        accept=" after  on_success "
+    else
+        accept=" after  on_failure "
+    fi
+    local trigger_file
+    for trigger_file in /home/agent/*/*/trigger; do
+        [[ -f "$trigger_file" ]] || continue
+        local line kind ref
+        line="$(grep -v '^[[:space:]]*#' "$trigger_file" | grep -v '^[[:space:]]*$' | head -1 || true)"
+        [[ -z "$line" ]] && continue
+        read -r kind ref _ <<<"$line"
+        [[ -z "${kind:-}" || -z "${ref:-}" || "$ref" != */* ]] && continue
+        [[ "$accept" == *" $kind "* ]] || continue
+
+        local ref_agent="${ref%%/*}" ref_task="${ref##*/}"
+        [[ "$ref_agent" == "$src_agent" && "$ref_task" == "$src_task" ]] || continue
+
+        local dst_dir dst_agent dst_task
+        dst_dir="$(dirname "$trigger_file")"
+        dst_task="$(basename "$dst_dir")"
+        dst_agent="$(basename "$(dirname "$dst_dir")")"
+
+        mkdir -p "$LOG_DIR"
+        printf '[%s] trigger %s/%s (%s rc=%d) -> %s/%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "$src_agent" "$src_task" "$kind" "$rc" \
+            "$dst_agent" "$dst_task" >>"$TRIGGER_LOG"
+
+        setsid /usr/local/bin/run-agent "$dst_agent" "$dst_task" \
+            >>"$TRIGGER_LOG" 2>&1 </dev/null &
+        disown $! 2>/dev/null || true
+    done
+}
 
 agent="${1:-}"
 task="${2:-}"
@@ -61,8 +112,23 @@ EXT=/usr/local/lib/chassis-ext/index.js
 
 cmd=(pi "${extra[@]}" --no-builtin-tools -e "$EXT")
 [[ -n "$prompt" ]] && cmd+=("$prompt")
-if [[ $(id -u) -eq 0 ]]; then
-    exec runuser -u agent -- env CHASSIS_AGENT="$agent" CHASSIS_TASK="$task" "${cmd[@]}"
-else
-    exec "${cmd[@]}"
+
+# Interactive (no task): hand the tty to pi and exit. No trigger fan-out for
+# operator-driven sessions; only scheduled/triggered tasks chain.
+if [[ -z "$task" ]]; then
+    if [[ $(id -u) -eq 0 ]]; then
+        exec runuser -u agent -- env CHASSIS_AGENT="$agent" CHASSIS_TASK="$task" "${cmd[@]}"
+    else
+        exec "${cmd[@]}"
+    fi
 fi
+
+# One-shot task: run, capture rc (without tripping set -e), fan out triggers.
+rc=0
+if [[ $(id -u) -eq 0 ]]; then
+    runuser -u agent -- env CHASSIS_AGENT="$agent" CHASSIS_TASK="$task" "${cmd[@]}" || rc=$?
+else
+    "${cmd[@]}" || rc=$?
+fi
+fire_triggers "$agent" "$task" "$rc" || true
+exit "$rc"

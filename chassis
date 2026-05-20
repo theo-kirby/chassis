@@ -411,6 +411,24 @@ def cmd_status(_args: argparse.Namespace) -> int:
     print("=== /etc/cron.d/chassis ===")
     exec_in(["cat", "/etc/cron.d/chassis"], user="root")
     print()
+    print("=== triggers ===")
+    # Trigger files aren't pre-rendered (parsed at fire time in run-agent), so
+    # surface them directly. Format: <dst-agent>/<dst-task> <- <kind> <src>.
+    exec_in(
+        ["sh", "-c",
+         "found=0; "
+         "for f in /home/agent/*/*/trigger; do "
+         "  [ -f \"$f\" ] || continue; "
+         "  line=$(grep -v '^[[:space:]]*#' \"$f\" | grep -v '^[[:space:]]*$' | head -1); "
+         "  [ -z \"$line\" ] && continue; "
+         "  d=$(dirname \"$f\"); "
+         "  task=$(basename \"$d\"); agent=$(basename $(dirname \"$d\")); "
+         "  printf '%s/%s  <-  %s\\n' \"$agent\" \"$task\" \"$line\"; "
+         "  found=1; "
+         "done; [ $found -eq 0 ] && echo '(no triggers)'"],
+        user="agent",
+    )
+    print()
     print("=== last 5 run-tool entries ===")
     exec_in(
         ["sh", "-c", "tail -n 5 /var/log/chassis/run-tool.jsonl 2>/dev/null || echo '(no audit log yet)'"],

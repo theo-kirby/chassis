@@ -23,10 +23,11 @@ an agent is a directory containing a system prompt and a config:
 /home/agent/{agent-name}/agent.json
 ```
 
-a task is a directory containing an instruction prompt, and a schedule:
+a task is a directory containing an instruction prompt and a launch rule — a cron schedule, a trigger pointing at another task, or both:
 ```
 /home/agent/{agent-name}/{task-name}/INSTRUCTIONS.md
-/home/agent/{agent-name}/{task-name}/cron
+/home/agent/{agent-name}/{task-name}/cron       # scheduled — single cron line
+/home/agent/{agent-name}/{task-name}/trigger    # event-driven — see Triggers
 ```
 
 These three base abstractions allow for an extremely general surface for configuring a large number of multi-agent systems.
@@ -47,6 +48,7 @@ An agent is a directory:
   tasks/morning/     ← optional; one per scheduled or named run
     INSTRUCTIONS.md  ← prompt for this run
     cron             ← single line, e.g. `0 7 * * *`
+    trigger         ← optional; e.g. `after researcher/scrape` (see Triggers)
 ```
 
 The seeded `manager` agent can edit, observe, and launch other agents from inside the container. The onboarding wizard (`chassis setup`) scaffolds new agents for you.
@@ -66,11 +68,34 @@ Skip the wizard with `chassis run manager`: the manager can scaffold agents from
 
 ## How it works
 
-- **One container per chassis.** Cron runs scheduled tasks; the seeded `manager` agent is your interactive mode.
+- **One container per chassis.** Cron runs scheduled tasks; triggers fan out from completed tasks; the seeded `manager` agent is your interactive mode.
 - **Two users.** `root` owns the runtime, tools, secrets, and cron. `agent` (UID 2000) owns its home and every agent definition, on a persistent volume.
 - **Privileged tool dispatcher.** Agents call `sudo run-tool <name> '<json-args>'`. The dispatcher validates args against a JSON schema and injects only the declared secrets into the tool's child env. See [`tools/README.md`](tools/README.md) for the contract.
-- **Audit log.** Every dispatcher call appends to `/var/log/chassis/run-tool.jsonl` with secrets redacted from stdout/stderr.
+- **Audit log.** Every dispatcher call appends to `/var/log/chassis/run-tool.jsonl` with secrets redacted from stdout/stderr. Trigger fan-outs append to `/var/log/chassis/triggers.log`.
 - **Dashboard.** [`dashboard/`](dashboard/) is a single-chassis web monitor: cron schedules, last agent runs, audit tail, and a drill-in for individual sessions. Auto-picks the chassis when one is running; pass `--chassis <name>` for multiples.
+
+## Triggers
+
+A task can be launched from a `cron` line (time), from a `trigger` line (the completion of another task), or both. The trigger file is a single line, parsed at fire time — no `reload-cron` needed when you add or edit one.
+
+Grammar:
+```
+after      <agent>/<task>    # fire when that task completes (any exit)
+on_success <agent>/<task>    # fire only on exit 0
+on_failure <agent>/<task>    # fire only on non-zero exit
+```
+
+Example — a reviewer that re-runs whenever the writer succeeds:
+```
+/home/agent/writer/draft/INSTRUCTIONS.md
+/home/agent/writer/draft/cron               0 9 * * *
+/home/agent/reviewer/critique/INSTRUCTIONS.md
+/home/agent/reviewer/critique/trigger       on_success writer/draft
+```
+
+Fan-out happens at the tail of `run-agent`: when a task finishes, every sibling `trigger` file whose reference matches the just-completed `(agent, task)` is fired in the background via `setsid run-agent`. Interactive sessions (no task argument) do not fan out.
+
+**Cycles are allowed by design** — `A → B → A` is a legitimate feedback loop (e.g. writer ↔ reviewer iterating). There's no DAG check; if you spin up a runaway loop, `pkill -f run-agent` inside the container is the off switch.
 
 ## Tools
 
@@ -149,7 +174,7 @@ Spins up a fully-namespaced throwaway container (own image tag, volumes, network
 
 | Changed | Run |
 |---|---|
-| Agent files in `/home/agent/agents/` | nothing |
+| Agent files in `/home/agent/agents/` (including `trigger`) | nothing |
 | Agent cron, or `tools/` on host | `chassis reload-cron` |
 | `.env` | `chassis down && chassis up` |
 | Anything in `harness/` | `chassis up` |
