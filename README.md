@@ -51,7 +51,7 @@ An agent is a directory:
     trigger         ← optional; e.g. `after researcher/scrape` (see Triggers)
 ```
 
-The seeded `manager` agent can edit, observe, and launch other agents from inside the container. The onboarding wizard (`chassis setup`) scaffolds new agents for you.
+The seeded `driver` agent can edit, observe, scaffold, and launch other agents from inside the container.
 
 ## Quick start
 
@@ -61,14 +61,12 @@ The seeded `manager` agent can edit, observe, and launch other agents from insid
 chassis init             # scaffold .env (mode 600)
 vim .env                 # add LLM_API_KEY + any tool secrets
 chassis up               # build and start
-chassis setup            # onboarding/chassis setup
+chassis run driver       # interactive session with the seeded driver agent
 ```
-
-Skip the wizard with `chassis run manager`: the manager can scaffold agents from inside the container too.
 
 ## How it works
 
-- **One container per chassis.** Cron runs scheduled tasks; triggers fan out from completed tasks; the seeded `manager` agent is your interactive mode.
+- **One container per chassis.** Cron runs scheduled tasks; triggers fan out from completed tasks; the seeded `driver` agent is your interactive mode.
 - **Two users.** `root` owns the runtime, tools, secrets, and cron. `agent` (UID 2000) owns its home and every agent definition, on a persistent volume.
 - **Privileged tool dispatcher.** Agents call `sudo run-tool <name> '<json-args>'`. The dispatcher validates args against a JSON schema and injects only the declared secrets into the tool's child env. See [`tools/README.md`](tools/README.md) for the contract.
 - **Audit log.** Every dispatcher call appends to `/var/log/chassis/run-tool.jsonl` with secrets redacted from stdout/stderr. Trigger fan-outs append to `/var/log/chassis/triggers.log`.

@@ -180,24 +180,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     return exec_in(cmd, user="agent", interactive=args.task is None)
 
 
-def cmd_setup(_args: argparse.Namespace) -> int:
-    """Drop into the onboarding wizard. Re-runnable any time — handy as a
-    refresher or for scaffolding more agents later. The template seed only
-    fires on virgin home volumes, so if the operator built this image before
-    onboarding was added, ensure the agent dir exists first.
-    """
-    ensure = (
-        "if [ ! -d /home/agent/onboarding ]; then "
-        "cp -r /usr/local/share/chassis/agent-template/onboarding /home/agent/onboarding "
-        "&& chown -R agent:agent /home/agent/onboarding; "
-        "fi"
-    )
-    rc = exec_in(["bash", "-c", ensure], user="root")
-    if rc != 0:
-        return rc
-    return exec_in(["/usr/local/bin/run-agent", "onboarding"], user="agent", interactive=True)
-
-
 def cmd_logs(args: argparse.Namespace) -> int:
     if args.agent:
         target = f"/var/log/chassis/agents/{args.agent}"
@@ -308,7 +290,7 @@ def cmd_test(args: argparse.Namespace) -> int:
             check=True,
         )
         # Allocate a TTY when the operator is on one, so interactive tests
-        # (e.g. `manager`, which drops into the pi TUI) are usable. Headless
+        # (e.g. `driver`, which drops into the pi TUI) are usable. Headless
         # tests (ping) don't care either way.
         exec_flags = ["-i"]
         if sys.stdout.isatty():
@@ -447,11 +429,11 @@ on one host.
 
 HELP_EPILOG = """\
 common workflows:
-  first run        chassis init && chassis up && chassis setup
-  attach manager   chassis run manager
+  first run        chassis init && chassis up && chassis run driver
+  attach driver    chassis run driver
   after tools/     chassis reload-cron
   smoke test       chassis test ping
-  tool sandbox     chassis test manager
+  tool sandbox     chassis test driver
 
 run `chassis <command> --help` for command-specific options.
 """
@@ -479,8 +461,6 @@ def main() -> int:
     sub.add_parser("status",      help="container state + cron file + recent log activity").set_defaults(func=cmd_status)
 
     # agent interaction
-    sub.add_parser("setup",       help="onboarding wizard — scaffolds your first agent").set_defaults(func=cmd_setup)
-
     p_run = sub.add_parser("run", help="run an agent (interactive if no task, one-shot otherwise)")
     p_run.add_argument("agent", help="agent name under /home/agent/")
     p_run.add_argument("task", nargs="?", default=None, help="optional task name for one-shot mode")
