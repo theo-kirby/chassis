@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import shlex
 from datetime import datetime, timezone
@@ -49,8 +50,11 @@ AUDIT_LOG = "/var/log/chassis/run-tool.jsonl"
 AGENTS_LOG_ROOT = "/var/log/chassis/agents"
 CRON_FILE = "/etc/cron.d/chassis"
 # Drill-in file reads are restricted to these prefixes inside the container.
-# Anything else returns 400 — the dashboard isn't a generic shell.
-ALLOWED_FILE_PREFIXES = ("/home/agent/.pi/", "/var/log/chassis/")
+# Anything else returns 400 — the dashboard isn't a generic shell. AGENT_HOME
+# is read from the env so a non-default chassis layout (e.g. per-user homes)
+# still allows the dashboard to peek at .pi/ session files.
+_AGENT_HOME = os.environ.get("AGENT_HOME", "/home/agent")
+ALLOWED_FILE_PREFIXES = (f"{_AGENT_HOME}/.pi/", "/var/log/chassis/")
 FILE_MAX_BYTES = 200_000
 
 # Override target; set from --chassis. None = auto-pick when exactly one
@@ -157,7 +161,7 @@ async def list_agents(container: str) -> list[str]:
     raw = await exec_in(
         container, "sh", "-c",
         f"ls {AGENTS_LOG_ROOT} 2>/dev/null; "
-        "for f in /home/agent/*/agent.json; do "
+        f"for f in {_AGENT_HOME}/*/agent.json; do "
         "[ -f \"$f\" ] && basename \"$(dirname \"$f\")\"; done",
     )
     seen: list[str] = []

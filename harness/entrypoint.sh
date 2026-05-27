@@ -3,6 +3,9 @@
 # chassis-entrypoint — container init. Stages the env file, seeds the agent
 # home if empty, renders models.json + tools-public.json + cron, then execs
 # cron. --reload re-runs only the tools-public.json + cron rendering.
+# --oneshot <agent> [task] runs init (everything but cron), then execs
+# run-agent once and exits with its status — for scheduler-driven,
+# scale-to-zero deployments (one container per run, no internal cron).
 
 set -euo pipefail
 
@@ -10,16 +13,31 @@ ENV_SRC=/run/secrets/chassis.env
 ENV_DST=/etc/chassis/.env
 TOOLS_SRC=/mnt/protected/tools/tools.json
 TOOLS_PUBLIC=/etc/chassis/tools-public.json
-AGENT_HOME=/home/agent
-SEED_MARKER=/home/agent/.chassis-seeded
+AGENT_HOME="${AGENT_HOME:-/home/agent}"
+export AGENT_HOME
+SEED_MARKER="$AGENT_HOME/.chassis-seeded"
 TEMPLATE_DIR=/usr/local/share/chassis/agent-template
 CRON_FILE=/etc/cron.d/chassis
 LOG_DIR=/var/log/chassis
 
 reload_only=0
-if [[ "${1:-}" == "--reload" ]]; then
-    reload_only=1
-fi
+oneshot=0
+oneshot_agent=""
+oneshot_task=""
+case "${1:-}" in
+    --reload)
+        reload_only=1
+        ;;
+    --oneshot)
+        oneshot=1
+        oneshot_agent="${2:-}"
+        oneshot_task="${3:-}"
+        if [[ -z "$oneshot_agent" ]]; then
+            echo "entrypoint: --oneshot needs <agent> [task]" >&2
+            exit 2
+        fi
+        ;;
+esac
 
 render_tools_public() {
     install -d -m 755 /etc/chassis
@@ -105,7 +123,10 @@ else
 fi
 echo "entrypoint: env staged"
 
-# 3. /home/agent ownership + virgin-volume seed
+# 3. $AGENT_HOME ownership + virgin-volume seed
+# When AGENT_HOME is per-user (e.g. /home/agent/users/<id>) it may not yet
+# exist on a fresh shared mount; create it first so the chown/chmod succeed.
+install -d -o agent -g agent -m 755 "$AGENT_HOME"
 chown agent:agent "$AGENT_HOME"
 chmod 755 "$AGENT_HOME"
 # Agents live directly at /home/agent/<name>/, so we can't detect "virgin
@@ -129,7 +150,7 @@ touch "$LOG_DIR/cron.log"
 chown agent:agent "$LOG_DIR/cron.log"
 
 # 4. models.json
-install -d -m 755 -o agent -g agent /home/agent/.pi/agent
+install -d -m 755 -o agent -g agent "$AGENT_HOME/.pi/agent"
 # LLM_API_KEY from env (e.g. compose `environment:` for tests) wins;
 # otherwise pull it out of the staged .env without sourcing the whole file
 # (avoids bash interpreting arbitrary tool secret values). Defaults to
@@ -140,7 +161,7 @@ if [[ -z "${LLM_API_KEY:-}" && -s "$ENV_DST" ]]; then
     LLM_API_KEY="${LLM_API_KEY%\'}"; LLM_API_KEY="${LLM_API_KEY#\'}"
 fi
 export LLM_API_KEY
-python3 - /home/agent/.pi/agent/models.json <<'PY'
+python3 - "$AGENT_HOME/.pi/agent/models.json" <<'PY'
 import json, os, sys
 cfg = {"providers": {"llm": {
     "baseUrl": os.environ.get("LLM_BASE_URL", "http://llm:8000/v1"),
@@ -159,14 +180,39 @@ cfg = {"providers": {"llm": {
 }}}
 json.dump(cfg, open(sys.argv[1], "w"), indent=2)
 PY
-chown agent:agent /home/agent/.pi/agent/models.json
-chmod 600 /home/agent/.pi/agent/models.json
+chown agent:agent "$AGENT_HOME/.pi/agent/models.json"
+chmod 600 "$AGENT_HOME/.pi/agent/models.json"
 echo "entrypoint: models.json rendered"
 
 # 5. tools-public.json
 render_tools_public
 
-# 6. cron
+# 6. cron — skipped in one-shot mode, where scheduling is external: a
+#    scheduler launches one container per run, so there's no internal cron.
+if (( oneshot )); then
+    # Bind this home to its subscriber if a provisioner hasn't already. The
+    # agent reads $AGENT_HOME/user.json for its id (not CHASSIS_USER), so the
+    # binding survives the tool dispatcher's env scrub. Idempotent: a warm,
+    # already-provisioned volume keeps its existing user.json untouched.
+    if [[ -n "${CHASSIS_USER:-}" && ! -f "$AGENT_HOME/user.json" ]]; then
+        python3 - "$CHASSIS_USER" > "$AGENT_HOME/user.json" <<'PY'
+import json, sys
+json.dump({"id": sys.argv[1]}, sys.stdout)
+PY
+        chown agent:agent "$AGENT_HOME/user.json"
+        chmod 600 "$AGENT_HOME/user.json"
+        echo "entrypoint: bound home to user '$CHASSIS_USER'"
+    fi
+    # Ready marker first (parity with the daemon path), then hand off. The
+    # container's exit status is the task's, so a scheduler can tell a clean
+    # run from a failure.
+    : > /run/chassis-ready
+    run_cmd=(/usr/local/bin/run-agent "$oneshot_agent")
+    [[ -n "$oneshot_task" ]] && run_cmd+=("$oneshot_task")
+    echo "entrypoint: one-shot, exec'ing run-agent $oneshot_agent ${oneshot_task:-(interactive)}"
+    exec tini -- "${run_cmd[@]}"
+fi
+
 render_cron
 
 # 7. hand off

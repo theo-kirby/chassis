@@ -2,16 +2,17 @@
 """
 ping — fire a one-shot completion at the configured LLM endpoint.
 
-Reads /home/agent/.pi/agent/models.json (rendered by the entrypoint from
+Reads $AGENT_HOME/.pi/agent/models.json (rendered by the entrypoint from
 LLM_* env vars + .env's LLM_API_KEY) and POSTs a short request. Exits
 non-zero on any failure. Stdlib only — no extra deps in the test image.
 """
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
-CFG = "/home/agent/.pi/agent/models.json"
+CFG = f"{os.environ.get('AGENT_HOME', '/home/agent')}/.pi/agent/models.json"
 PROMPT = "Reply with the single word: pong"
 
 
