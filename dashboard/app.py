@@ -31,9 +31,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import shlex
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -48,14 +49,21 @@ CHASSIS_SUFFIX = "-chassis"
 AUDIT_LOG = "/var/log/chassis/run-tool.jsonl"
 AGENTS_LOG_ROOT = "/var/log/chassis/agents"
 CRON_FILE = "/etc/cron.d/chassis"
+TRIGGER_LOG = "/var/log/chassis/triggers.log"
 # Drill-in file reads are restricted to these prefixes inside the container.
 # Anything else returns 400 — the dashboard isn't a generic shell.
 ALLOWED_FILE_PREFIXES = ("/home/agent/.pi/", "/var/log/chassis/")
 FILE_MAX_BYTES = 200_000
 
 # Override target; set from --chassis. None = auto-pick when exactly one
-# chassis container is running.
-CHASSIS_NAME: str | None = None
+# chassis container is running. Env var fallback lets the uvicorn --reload
+# subprocess (which re-imports this module instead of running main) inherit
+# the value chosen on the command line.
+CHASSIS_NAME: str | None = os.environ.get("CHASSIS_NAME") or None
+
+# Stamped at module import; changes whenever the server restarts. The dashboard
+# polls this so the browser auto-reloads after a --reload-triggered restart.
+SERVER_BOOT = datetime.now(timezone.utc).isoformat()
 
 _SAFE_NAME = re.compile(r"^[a-zA-Z0-9_.-]+$")
 
@@ -114,6 +122,94 @@ async def docker_inspect(name: str) -> dict:
         "started_at": parts[1],
         "restart_count": int(parts[2] or 0),
         "running": parts[3].lower() == "true",
+    }
+
+
+# When the container has no compose-set CPU/mem limit, the gauge ceiling
+# defaults to this fraction of host capacity. A single chassis shouldn't
+# normally consume the whole host, so 50% gives the gauge meaningful
+# headroom — a half-full bar means "using a quarter of the host," and
+# crossing 100% (which clamps + turns red) is a real "hot" signal.
+HOST_FALLBACK_FRACTION = 0.5
+
+
+def host_cpu_cores() -> float:
+    return float(os.cpu_count() or 1)
+
+
+def host_memory_bytes() -> int:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        return 0
+
+
+def _parse_cpuset(s: str) -> int:
+    """`CpusetCpus` is a comma-separated list of indices and ranges like
+    "0,2-4,7". Returns the count of distinct CPUs it pins to."""
+    n = 0
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            a, b = tok.split("-", 1)
+            try:
+                n += int(b) - int(a) + 1
+            except ValueError:
+                pass
+        elif tok.isdigit():
+            n += 1
+    return n
+
+
+async def container_limits(name: str) -> dict:
+    """Return the effective CPU/memory ceiling for this container so the
+    dashboard gauges scale to "% of what the container can actually use,"
+    not "% of host." Compose's `cpus:` populates NanoCpus, `mem_limit:`
+    populates Memory; `cpuset:` populates CpusetCpus. When all three are
+    unset (the chassis default), we fall back to host totals."""
+    rc, out, _ = await sh(
+        "docker", "inspect", name, "--format",
+        "{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}|{{.HostConfig.CpusetCpus}}",
+    )
+    nano = 0
+    mem = 0
+    cpuset = ""
+    if rc == 0:
+        parts = out.strip().split("|")
+        if len(parts) == 3:
+            try:
+                nano = int(parts[0] or 0)
+                mem = int(parts[1] or 0)
+                cpuset = parts[2] or ""
+            except ValueError:
+                pass
+    if nano > 0:
+        cpu_cores = nano / 1e9
+        cpu_source = "limit"
+    elif cpuset:
+        n = _parse_cpuset(cpuset)
+        if n > 0:
+            cpu_cores = float(n)
+            cpu_source = "cpuset"
+        else:
+            cpu_cores = host_cpu_cores() * HOST_FALLBACK_FRACTION
+            cpu_source = "host"
+    else:
+        cpu_cores = host_cpu_cores() * HOST_FALLBACK_FRACTION
+        cpu_source = "host"
+    if mem > 0:
+        mem_bytes = mem
+        mem_source = "limit"
+    else:
+        mem_bytes = int(host_memory_bytes() * HOST_FALLBACK_FRACTION)
+        mem_source = "host"
+    return {
+        "cpu_cores": cpu_cores,
+        "cpu_source": cpu_source,
+        "mem_bytes": mem_bytes,
+        "mem_source": mem_source,
     }
 
 
@@ -221,39 +317,247 @@ async def cron_jobs(container: str) -> list[dict]:
         cmd = re.sub(r"\s*>>.*$", "", cmd)
         cmd = re.sub(r"^/usr/local/bin/run-agent\s+", "", cmd)
         next_fire = None
+        next_fires: list[str] = []
         if croniter:
             try:
-                next_fire = croniter(expr, now).get_next(datetime).replace(tzinfo=timezone.utc).isoformat()
+                it = croniter(expr, now)
+                deadline = now + timedelta(hours=24)
+                # Cap enumeration so "* * * * *" (1440 fires/day) doesn't blow
+                # up the JSON payload. 300 covers everything */5-and-slower
+                # fully within 24h; denser exprs render as a near-continuous
+                # bar regardless.
+                for _ in range(300):
+                    t = it.get_next(datetime)
+                    if t > deadline:
+                        break
+                    next_fires.append(t.replace(tzinfo=timezone.utc).isoformat())
+                if next_fires:
+                    next_fire = next_fires[0]
             except Exception:
                 pass
-        jobs.append({"schedule": expr, "command": cmd, "next": next_fire})
+        jobs.append({
+            "schedule": expr,
+            "command": cmd,
+            "next": next_fire,
+            "next_fires": next_fires,
+        })
     return jobs
+
+
+# Trigger files are parsed at fire time by run-agent, so we read them straight
+# from each task directory rather than from a pre-rendered index.
+TRIGGER_LINE_RE = re.compile(
+    r"^(?P<kind>\S+)\s+(?P<ref>\S+)"
+    r"(?:\s+when\s+(?P<wkey>\S+)\s+(?P<wop>==|!=|<=|>=|<|>)\s+(?P<wval>\S+))?"
+)
+# Fan-out log lines look like:
+#   [2026-05-20T13:27:18Z] trigger writer/draft (on_success rc=0 verdict={score=7}) -> editor/polish when score > 5
+FIRE_RE = re.compile(
+    r"^\[(?P<ts>[^\]]+)\] trigger (?P<src_agent>[^/]+)/(?P<src_task>\S+) "
+    r"\((?P<kind>\S+) rc=(?P<rc>-?\d+)(?: verdict=\{(?P<verdict>[^}]*)\})?\) "
+    r"-> (?P<dst_agent>[^/]+)/(?P<dst_task>\S+?)"
+    r"(?:\s+when\s+(?P<wkey>\S+)\s+(?P<wop>==|!=|<=|>=|<|>)\s+(?P<wval>\S+))?$"
+)
+
+
+async def task_graph(container: str) -> list[dict]:
+    """One entry per task directory under /home/agent/<agent>/<task>/, with
+    its cron line and parsed trigger (if any). Source of truth for the
+    trigger graph: matches what run-agent's fan-out actually reads."""
+    raw = await exec_in(
+        container, "sh", "-c",
+        # Reading the per-task `cron` and `trigger` files directly (rather
+        # than /etc/cron.d/chassis) keeps the graph aligned with run-agent's
+        # view, including changes not yet picked up by reload-cron.
+        "for d in /home/agent/*/*/; do "
+        "  [ -f \"$d/INSTRUCTIONS.md\" ] || continue; "
+        "  task=$(basename \"$d\"); "
+        "  agent=$(basename \"$(dirname \"$d\")\"); "
+        "  cron=$(grep -v '^[[:space:]]*#' \"$d/cron\" 2>/dev/null | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[[:space:]]*//'); "
+        "  trig=$(grep -v '^[[:space:]]*#' \"$d/trigger\" 2>/dev/null | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[[:space:]]*//'); "
+        "  printf '%s\\t%s\\t%s\\t%s\\n' \"$agent\" \"$task\" \"$cron\" \"$trig\"; "
+        "done",
+    )
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    tasks: list[dict] = []
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        agent, task, cron_line, trig_line = parts[0], parts[1], parts[2] or None, parts[3] or None
+        next_fire = None
+        if cron_line and croniter:
+            try:
+                next_fire = croniter(cron_line, now).get_next(datetime).replace(tzinfo=timezone.utc).isoformat()
+            except Exception:
+                pass
+        trigger = None
+        if trig_line:
+            tm = TRIGGER_LINE_RE.match(trig_line)
+            if tm and "/" in tm["ref"]:
+                src_agent, src_task = tm["ref"].split("/", 1)
+                when_clause = None
+                if tm["wkey"]:
+                    when_clause = {"key": tm["wkey"], "op": tm["wop"], "value": tm["wval"]}
+                trigger = {
+                    "kind": tm["kind"],
+                    "agent": src_agent,
+                    "task": src_task,
+                    "when": when_clause,
+                }
+        tasks.append({
+            "agent": agent,
+            "task": task,
+            "cron": cron_line,
+            "next": next_fire,
+            "trigger": trigger,
+        })
+    tasks.sort(key=lambda t: (t["agent"], t["task"]))
+    return tasks
+
+
+async def trigger_fires(container: str, n: int = 30) -> list[dict]:
+    raw = await exec_in(
+        container, "sh", "-c",
+        f"tail -n {n} {TRIGGER_LOG} 2>/dev/null",
+    )
+    fires: list[dict] = []
+    for line in raw.splitlines():
+        m = FIRE_RE.match(line)
+        if not m:
+            continue
+        # verdict={k=v,k2=v2} → {"k": "v", "k2": "v2"}. The string is what
+        # fire_triggers wrote, so we don't have to defend against arbitrary
+        # punctuation — but skip malformed pairs defensively.
+        verdict: dict[str, str] = {}
+        vstr = m["verdict"] or ""
+        for pair in vstr.split(","):
+            if "=" in pair:
+                k, _, v = pair.partition("=")
+                if k:
+                    verdict[k] = v
+        when_clause = None
+        if m["wkey"]:
+            when_clause = {"key": m["wkey"], "op": m["wop"], "value": m["wval"]}
+        fires.append({
+            "ts": m["ts"],
+            "src_agent": m["src_agent"], "src_task": m["src_task"],
+            "kind": m["kind"],
+            "rc": int(m["rc"]),
+            "verdict": verdict,
+            "dst_agent": m["dst_agent"], "dst_task": m["dst_task"],
+            "when": when_clause,
+        })
+    fires.reverse()
+    return fires
+
+
+# LLM_* keys are injected into the container via compose `env_file: harness/llm.env`,
+# so they're readable from any `docker exec` shell (not just descendants of the
+# entrypoint). Order here drives the order in the Configuration modal.
+CONFIG_KEYS = (
+    ("LLM_MODEL_ID", "model"),
+    ("LLM_CONTEXT_WINDOW", "context_window"),
+    ("LLM_MAX_TOKENS", "max_tokens"),
+    ("LLM_THINKING", "thinking"),
+    ("LLM_API_KIND", "api_kind"),
+    ("LLM_BASE_URL", "base_url"),
+)
+
+
+async def chassis_config(container: str) -> dict:
+    """Pull LLM_* env vars from inside the container. The compose file injects
+    them via env_file, so they're visible in any exec'd shell's environment."""
+    raw = await exec_in(
+        container, "sh", "-c",
+        "for k in " + " ".join(k for k, _ in CONFIG_KEYS) + "; do "
+        '  printf "%s\\t%s\\n" "$k" "$(printenv "$k" 2>/dev/null)"; '
+        "done; "
+        # Best-effort harness id: which CLI run-agent invokes. Cheap probe.
+        'printf "HARNESS\\t%s\\n" "$(command -v pi >/dev/null 2>&1 && echo pi || echo unknown)"',
+    )
+    cfg: dict = {}
+    for line in raw.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        key, val = parts[0], parts[1]
+        if not val:
+            continue
+        if key == "HARNESS":
+            cfg["harness"] = val
+            continue
+        for env_key, out_key in CONFIG_KEYS:
+            if env_key == key:
+                cfg[out_key] = val
+                break
+    return cfg
+
+
+# Matches `run-agent <agent> <task>` in process listings — covers cron-triggered
+# runs and trigger fan-outs (both go through /usr/local/bin/run-agent).
+RUN_AGENT_RE = re.compile(r"(?:^|/)run-agent\s+(\S+)\s+(\S+)")
+
+
+async def running_tasks(container: str) -> set[tuple[str, str]]:
+    """Set of (agent, task) tuples whose run-agent process is currently
+    executing. Process-based detection is reliable; jsonl mtime isn't,
+    because the run log is one line per session, not appended throughout."""
+    raw = await exec_in(
+        container, "sh", "-c",
+        "ps -eo args 2>/dev/null",
+        user="root",
+    )
+    found: set[tuple[str, str]] = set()
+    for line in raw.splitlines():
+        m = RUN_AGENT_RE.search(line)
+        if not m:
+            continue
+        found.add((m.group(1), m.group(2)))
+    return found
 
 
 async def chassis_snapshot(meta: dict) -> dict:
     name = meta["name"]
-    inspect, stats = await asyncio.gather(
+    inspect, stats, limits = await asyncio.gather(
         docker_inspect(name),
         docker_stats(name),
+        container_limits(name),
     )
     snap: dict = {
         "name": name,
         "project": meta["project"],
         "status_line": meta["status_line"],
         "stats": stats,
+        "limits": limits,
         **inspect,
     }
     if not inspect.get("running"):
         return snap
-    audit, agents, jobs = await asyncio.gather(
+    audit, agents, jobs, tasks, fires, config, running = await asyncio.gather(
         tail_audit(name, 50),
         list_agents(name),
         cron_jobs(name),
+        task_graph(name),
+        trigger_fires(name),
+        chassis_config(name),
+        running_tasks(name),
     )
     agent_runs = await asyncio.gather(*(agent_last_run(name, a) for a in agents))
-    snap["agents"] = [{"name": a, "last_run": r} for a, r in zip(agents, agent_runs)]
+    # An agent counts as "running" if any of its tasks has an active run-agent
+    # process. Tasks themselves keep a per-task flag for graph-node pulsing.
+    running_agents = {a for a, _ in running}
+    for t in tasks:
+        t["running"] = (t["agent"], t["task"]) in running
+    snap["agents"] = [
+        {"name": a, "last_run": r, "running": a in running_agents}
+        for a, r in zip(agents, agent_runs)
+    ]
     snap["audit"] = audit
     snap["cron"] = jobs
+    snap["tasks"] = tasks
+    snap["fires"] = fires
+    snap["config"] = config
     return snap
 
 
@@ -285,26 +589,32 @@ async def api_state():
     if err or meta is None:
         return JSONResponse({
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "server_boot": SERVER_BOOT,
             "error": err,
             "chassis": None,
         })
     snap = await chassis_snapshot(meta)
     return JSONResponse({
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "server_boot": SERVER_BOOT,
         "chassis": snap,
     })
 
 
 @app.get("/api/runs/{container}/{agent}")
-async def api_runs(container: str, agent: str, limit: int = 20):
+async def api_runs(container: str, agent: str, limit: int = 20, task: str | None = None):
     """Most-recent run records for one agent in one chassis. Each entry is the
-    first JSON line of a run log under /var/log/chassis/agents/<agent>/."""
+    first JSON line of a run log under /var/log/chassis/agents/<agent>/.
+    Pass ?task=<task> to restrict to a single task subdirectory."""
     if not (_safe_name(container) and _safe_name(agent)):
         return JSONResponse({"error": "invalid name"}, status_code=400)
+    if task is not None and not _safe_name(task):
+        return JSONResponse({"error": "invalid task"}, status_code=400)
     limit = max(1, min(limit, 100))
+    scope = f"{AGENTS_LOG_ROOT}/{agent}/{task}" if task else f"{AGENTS_LOG_ROOT}/{agent}"
     raw = await exec_in(
         container, "sh", "-c",
-        f'find {AGENTS_LOG_ROOT}/{agent} -type f -name "*.jsonl" '
+        f'find {scope} -type f -name "*.jsonl" '
         f'-printf "%T@ %p\\n" 2>/dev/null | sort -n | tail -{limit}',
     )
     runs: list[dict] = []
@@ -348,61 +658,151 @@ INDEX_HTML = r"""<!doctype html>
 <title>chassis</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏎️</text></svg>">
 <style>
-  :root { color-scheme: dark; }
-  body { font: 12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:#0d1117; color:#c9d1d9; margin:0; padding:0; }
-  .topbar { display:flex; align-items:center; gap:18px; padding:8px 16px; background:#010409; border-bottom:1px solid #30363d; color:#c9d1d9; }
+  :root {
+    color-scheme: dark;
+    --bg-base:   #0a0a0a;
+    --bg-card:   #141414;
+    --bg-sub:    #1c1c1c;
+    --bg-hover:  #222222;
+    --border-1:  #2a2a2a;
+    --border-2:  #3a3a3a;
+    --text-1:    #f5f5f5;
+    --text-2:    #b8b8b8;
+    --text-3:    #808080;
+    --text-4:    #555555;
+    --red:       #ef4444;
+    --red-soft:  #fca5a5;
+    --red-dim:   #5a1a1a;
+    --green:     #4ade80;
+  }
+  html, body { height:100%; }
+  html { overflow:hidden; }
+  body { font: 12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:var(--bg-base); color:var(--text-2); margin:0; padding:0; display:flex; flex-direction:column; overflow:hidden; }
+  .topbar { display:flex; align-items:center; gap:18px; padding:8px 16px; background:#050505; border-bottom:1px solid var(--border-1); color:var(--text-1); }
   .topbar .brand { display:flex; align-items:center; gap:8px; font-size:15px; font-weight:600; letter-spacing:.3px; }
-  .topbar .brand .car { font-size:18px; filter:saturate(1.2); }
-  .topbar .brand .name { color:#c9d1d9; }
-  .topbar .brand .chassis { color:#8b949e; font-weight:500; }
-  .topbar .config { display:flex; gap:14px; align-items:center; color:#c9d1d9; font-size:11.5px; padding-left:8px; border-left:1px solid #21262d; }
+  .topbar .brand .car { font-size:18px; filter:saturate(1.4); }
+  .topbar .brand .name { color:var(--red); }
+  .topbar .brand .chassis { color:var(--text-2); font-weight:500; }
+  .topbar .config { display:flex; gap:14px; align-items:center; color:var(--text-1); font-size:11.5px; padding:4px 10px; border-left:1px solid var(--border-1); border-radius:4px; cursor:pointer; transition:background .12s; }
+  .topbar .config:hover { background:var(--bg-hover); }
   .topbar .config:empty { display:none; }
   .topbar .config .cfg { display:flex; align-items:baseline; gap:6px; }
-  .topbar .config .cfg-k { color:#6e7681; text-transform:uppercase; font-size:10px; letter-spacing:.6px; }
-  .topbar .age { color:#6e7681; font-size:11px; margin-left:auto; }
-  .page { padding:14px; max-width:1400px; margin:0 auto; box-sizing:border-box; }
-  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin-bottom:14px; }
-  .stat { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:10px 12px; display:flex; flex-direction:column; gap:4px; min-height:80px; }
-  .stat .label { color:#6e7681; font-size:10px; text-transform:uppercase; letter-spacing:.6px; }
-  .stat .value { font-size:20px; font-weight:600; color:#c9d1d9; line-height:1.15; }
-  .stat .value .sub { color:#6e7681; font-size:11px; font-weight:400; }
+  .topbar .config .cfg-k { color:var(--text-3); text-transform:uppercase; font-size:10px; letter-spacing:.6px; }
+  .topbar .config .cfg-more { color:var(--text-3); font-size:10px; }
+  .topbar .age { color:var(--text-3); font-size:11px; margin-left:auto; }
+  .page {
+    flex:1 1 0;
+    min-height:0;
+    padding:12px;
+    max-width:1400px;
+    margin:0 auto;
+    width:100%;
+    box-sizing:border-box;
+    display:grid;
+    /* stats (auto) · main content (flex) */
+    grid-template-rows: auto minmax(0,1fr);
+    gap:10px;
+    overflow:hidden;
+  }
+  /* Two-column body: left holds triggers above agents/events, right holds schedule. */
+  .main { display:grid; grid-template-columns: minmax(0,1fr) minmax(280px,360px); gap:10px; min-height:0; overflow:hidden; }
+  .main-left { display:grid; grid-template-rows: minmax(0,1fr) minmax(0,1fr); gap:10px; min-height:0; overflow:hidden; }
+  .main-right { display:grid; grid-template-rows: minmax(0,1fr); min-height:0; overflow:hidden; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
+  .stat { background:var(--bg-card); border:1px solid var(--border-1); border-radius:6px; padding:10px 12px; display:flex; flex-direction:column; gap:4px; min-height:80px; }
+  .stat .label { color:var(--text-3); font-size:10px; text-transform:uppercase; letter-spacing:.6px; }
+  .stat .value { font-size:20px; font-weight:600; color:var(--text-1); line-height:1.15; }
+  .stat .value .sub { color:var(--text-3); font-size:11px; font-weight:400; }
   .stat svg.gauge { display:block; width:100%; height:24px; margin-top:auto; }
-  .blocks { display:grid; grid-template-columns:1fr; gap:12px; }
-  .block { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:12px 14px; }
-  .block h3 { margin:0 0 8px; font-size:12px; font-weight:600; color:#6e7681; text-transform:uppercase; letter-spacing:.6px; }
+  /* Each block is a grid with a fixed h3 header and a 1fr body that scrolls
+   * when content overflows its grid cell — the page itself never scrolls.
+   * Grid is more predictable than flex here: in a fixed-height outer row
+   * (1fr) the body fills the remainder; in an auto-sized outer row the body
+   * sizes to its content without collapsing (which flex-basis:0 does). */
+  .block { background:var(--bg-card); border:1px solid var(--border-1); border-radius:6px; padding:10px 14px; min-width:0; min-height:0; display:grid; grid-template-rows:auto minmax(0,1fr); overflow:hidden; }
+  .block-body { min-height:0; overflow:auto; }
+  .blocks { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; min-height:0; overflow:hidden; }
+  @media (max-width: 900px) {
+    /* Narrow viewports: surrender the no-scroll constraint — stack and let the page scroll. */
+    html, body { overflow:auto; height:auto; }
+    .page { overflow:visible; grid-template-rows:auto auto; }
+    .main { grid-template-columns:1fr; overflow:visible; }
+    .main-left, .main-right { grid-template-rows:auto; overflow:visible; }
+    .block, .blocks > .block { overflow:visible; }
+    .block-body { overflow:visible; }
+    .blocks { grid-template-columns:1fr; }
+  }
+  .block h3 { margin:0 0 8px; font-size:12px; font-weight:600; color:var(--text-3); text-transform:uppercase; letter-spacing:.6px; }
   .dot { width:8px; height:8px; border-radius:50%; display:inline-block; flex:none; }
-  .dot.up { background:#3fb950; }
-  .dot.down { background:#f85149; }
+  .dot.up { background:var(--text-1); }
+  .dot.down { background:var(--red); }
+  .dot.running { background:var(--red); animation: pulse 1.5s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; box-shadow:0 0 0 0 var(--red-dim); } 50% { opacity:.55; box-shadow:0 0 0 3px transparent; } }
   .line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:1px 0; }
-  .line.deny { color:#f85149; }
-  .ts { color:#6e7681; display:inline-block; min-width:5.5em; }
+  .line.deny { color:var(--red); }
+  .ts { color:var(--text-3); display:inline-block; min-width:5.5em; }
   table { width:100%; border-collapse:collapse; font-size:12px; }
   td { padding:2px 10px 2px 0; vertical-align:top; }
-  td.k { color:#8b949e; white-space:nowrap; }
-  .empty { color:#6e7681; font-style:italic; font-size:11.5px; padding:4px 0; }
-  code { background:#21262d; padding:1px 5px; border-radius:3px; font-size:11px; }
-  .pill { display:inline-block; padding:1px 6px; border-radius:10px; font-size:10px; background:#21262d; color:#8b949e; }
+  td.k { color:var(--text-2); white-space:nowrap; }
+  .empty { color:var(--text-3); font-style:italic; font-size:11.5px; padding:4px 0; }
+  code { background:var(--bg-sub); padding:1px 5px; border-radius:3px; font-size:11px; color:var(--text-1); }
+  .pill { display:inline-block; padding:1px 6px; border-radius:10px; font-size:10px; background:var(--bg-sub); color:var(--text-2); border:1px solid var(--border-1); }
+  .pill.bad { color:var(--red-soft); border-color:var(--red-dim); }
   .clickable { cursor:pointer; }
-  .clickable:hover { background:#1f2630; }
-  .error-page { padding:40px; color:#f85149; font-size:13px; }
+  .clickable:hover { background:var(--bg-hover); }
+  .error-page { padding:40px; color:var(--red); font-size:13px; }
   .modal { position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center; }
   .modal[hidden] { display:none; }
-  .modal-backdrop { position:absolute; inset:0; background:rgba(0,0,0,.7); }
-  .modal-body { position:relative; background:#161b22; border:1px solid #30363d; border-radius:8px; max-width:min(90vw,1100px); max-height:85vh; min-width:480px; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,.6); }
-  .modal-head { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-bottom:1px solid #30363d; gap:12px; }
-  .modal-title { font-size:13px; font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .modal-close { background:none; border:none; color:#8b949e; cursor:pointer; font-size:14px; padding:0 4px; }
-  .modal-close:hover { color:#c9d1d9; }
+  .modal-backdrop { position:absolute; inset:0; background:rgba(0,0,0,.78); }
+  .modal-body { position:relative; background:var(--bg-card); border:1px solid var(--border-2); border-radius:8px; max-width:min(90vw,1100px); max-height:85vh; min-width:480px; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,.7); }
+  .modal-head { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-bottom:1px solid var(--border-1); gap:12px; }
+  .modal-title { font-size:13px; font-weight:600; flex:1; color:var(--text-1); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .modal-close { background:none; border:none; color:var(--text-3); cursor:pointer; font-size:14px; padding:0 4px; }
+  .modal-close:hover { color:var(--text-1); }
   .modal-content { padding:12px 14px; overflow:auto; flex:1; font-size:11.5px; }
-  .modal-content pre { white-space:pre-wrap; word-break:break-word; margin:0; font-family:inherit; color:#c9d1d9; }
+  .modal-content pre { white-space:pre-wrap; word-break:break-word; margin:0; font-family:inherit; color:var(--text-1); }
   .modal-content table { margin-top:4px; }
   .modal-content td { padding:3px 10px 3px 0; }
-  .modal-content a.link { color:#58a6ff; cursor:pointer; text-decoration:underline; }
-  .modal-content .back { display:inline-block; margin-bottom:8px; color:#8b949e; cursor:pointer; }
-  .modal-content .back:hover { color:#c9d1d9; }
+  .modal-content a.link { color:var(--text-1); cursor:pointer; text-decoration:underline; text-decoration-color:var(--text-3); }
+  .modal-content a.link:hover { text-decoration-color:var(--red); }
+  .modal-content .back { display:inline-block; margin-bottom:8px; color:var(--text-3); cursor:pointer; }
+  .modal-content .back:hover { color:var(--text-1); }
+  .modal-content .kv { display:grid; grid-template-columns:max-content 1fr; gap:6px 18px; }
+  .modal-content .kv dt { color:var(--text-3); text-transform:uppercase; font-size:10px; letter-spacing:.6px; align-self:center; }
+  .modal-content .kv dd { margin:0; color:var(--text-1); word-break:break-all; }
+  .graph-wrap { overflow:hidden; padding:0; position:relative; }
+  .graph { display:block; width:100%; height:100%; cursor:grab; touch-action:none; user-select:none; }
+  .graph.panning { cursor:grabbing; }
+  /* In the hero block, the graph fills the available vertical space above the legend. */
+  .hero-graph .block-body { display:flex; flex-direction:column; gap:6px; }
+  .hero-graph .graph-wrap { flex:1 1 0; min-height:0; }
+  .hero-graph .graph-legend { flex:0 0 auto; margin-top:0; }
+  .graph .node rect { fill:var(--bg-sub); stroke:var(--border-2); transition:stroke .12s; }
+  .graph .node.cron rect { stroke:var(--text-1); }
+  .graph .node.orphan rect { stroke-dasharray:3 3; stroke:var(--border-2); }
+  .graph .node.running rect { stroke:var(--red); animation:strokePulse 1.5s ease-in-out infinite; }
+  @keyframes strokePulse { 0%,100% { stroke:var(--red); } 50% { stroke:var(--red-dim); } }
+  .graph .node:hover rect { stroke:var(--text-1); }
+  .graph .node.running:hover rect { stroke:var(--red); }
+  .graph .node text.title { fill:var(--text-1); font:600 11.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; pointer-events:none; }
+  .graph .node text.sub { fill:var(--text-3); font:10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; pointer-events:none; }
+  .graph .edge { fill:none; stroke-width:1.4; }
+  .graph .edge.after { stroke:var(--text-3); }
+  .graph .edge.on_success { stroke:var(--green); }
+  .graph .edge.on_failure { stroke:var(--red); }
+  .graph-legend { display:flex; gap:14px; margin-top:8px; font-size:10.5px; color:var(--text-3); flex-wrap:wrap; }
+  .graph-legend .swatch { display:inline-block; width:14px; height:2px; vertical-align:middle; margin-right:5px; }
+  .graph-legend .swatch.dashed { border-top:1.5px dashed var(--text-3); height:0; }
+  .agenda { display:flex; flex-direction:column; gap:1px; max-width:640px; }
+  .agenda-band { color:var(--text-3); font-size:10px; text-transform:uppercase; letter-spacing:.6px; padding:8px 0 3px; margin-top:6px; border-top:1px solid var(--border-1); }
+  .agenda-band:first-child { border-top:none; margin-top:0; padding-top:2px; }
+  .agenda-row { display:flex; gap:14px; padding:2px 0; align-items:baseline; font-size:12px; line-height:1.35; }
+  .agenda-when { flex:0 0 96px; color:var(--text-2); font-variant-numeric:tabular-nums; }
+  .agenda-label { color:var(--text-1); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .ev-kind { display:inline-block; min-width:34px; font-size:9.5px; color:var(--text-3); text-transform:uppercase; letter-spacing:.5px; margin-right:4px; }
   .badges { position:fixed; bottom:10px; right:12px; display:flex; gap:6px; z-index:40; pointer-events:none; }
-  .badge { padding:2px 8px; border-radius:10px; font-size:10px; font-weight:600; letter-spacing:.6px; text-transform:uppercase; border:1px solid; background:#0d1117; }
-  .badge.beta { color:#d29922; border-color:#d29922; background:rgba(210,153,34,.10); }
+  .badge { padding:2px 8px; border-radius:10px; font-size:10px; font-weight:600; letter-spacing:.6px; text-transform:uppercase; border:1px solid; background:var(--bg-base); }
+  .badge.beta { color:var(--red); border-color:var(--red-dim); background:rgba(239,68,68,.08); }
 </style>
 </head>
 <body>
@@ -427,37 +827,36 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 function escape(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function parseNum(s){if(s==null)return 0;const m=String(s).match(/-?[\d.]+/);return m?parseFloat(m[0]):0;}
-// Grafana retro-LCD bar gauge: the track is composed of N small vertical
-// segments. Segments left of the value are "lit" using the gradient color
-// at their position (green near 0%, amber near 55%, red near 100%); segments
-// to the right are dim. Snapping the fill to a segment boundary keeps the
-// look crisp — no half-lit cells.
+// Retro-LCD bar gauge: N small vertical segments. Lit segments scale from
+// dim grey (left) to white (right), then tint toward red as the gauge nears
+// its max — so the gauge communicates "how full" via brightness and only
+// uses red as an "approaching limit" cue. Snapping fill to segment boundaries
+// keeps the look crisp.
 const GAUGE_W = 120, GAUGE_H = 24, GAUGE_BAR_Y = 5, GAUGE_BAR_H = 14;
 const GAUGE_SEGMENTS = 44;
 const GAUGE_SEG_GAP  = 0.5;
 const GAUGE_SEG_W    = (GAUGE_W - GAUGE_SEG_GAP * (GAUGE_SEGMENTS - 1)) / GAUGE_SEGMENTS;
-const GAUGE_DIM      = "#21262d";
-
-// Three-stop gradient: green (0%) → amber (55%) → red (100%). Linear interp
-// in straight RGB — fine for this short range and matches Grafana's "Continuous
-// Green Yellow Red" feel without dragging in HSL math.
-const GAUGE_STOPS = [
-  [0.00, [0x3f, 0xb9, 0x50]],
-  [0.55, [0xd2, 0x99, 0x22]],
-  [1.00, [0xf8, 0x51, 0x49]],
-];
+const GAUGE_DIM      = "#2a2a2a";   // --border-1 — unlit segments
+const GAUGE_LIT_LO   = [0x55, 0x55, 0x55];  // --text-4 (dim end of the lit ramp)
+const GAUGE_LIT_HI   = [0xf5, 0xf5, 0xf5];  // --text-1 (bright end)
+const GAUGE_RED      = [0xef, 0x44, 0x44];  // --red — tinted onto the bright end past the heat threshold
+const GAUGE_HEAT     = 0.80;        // past this fraction, lit segments blend toward red
 function gaugeColor(t){
-  for (let i = 0; i < GAUGE_STOPS.length - 1; i++){
-    const [t1, c1] = GAUGE_STOPS[i], [t2, c2] = GAUGE_STOPS[i+1];
-    if (t <= t2){
-      const f = (t - t1) / (t2 - t1);
-      const r = Math.round(c1[0] + (c2[0]-c1[0])*f);
-      const g = Math.round(c1[1] + (c2[1]-c1[1])*f);
-      const b = Math.round(c1[2] + (c2[2]-c1[2])*f);
-      return `#${((r<<16)|(g<<8)|b).toString(16).padStart(6,"0")}`;
-    }
+  // t = position along the bar in [0,1]. Linear grey ramp; past GAUGE_HEAT,
+  // blend the leading segments toward red proportional to how far past we are.
+  const f = Math.max(0, Math.min(t, 1));
+  const r0 = GAUGE_LIT_LO[0] + (GAUGE_LIT_HI[0] - GAUGE_LIT_LO[0]) * f;
+  const g0 = GAUGE_LIT_LO[1] + (GAUGE_LIT_HI[1] - GAUGE_LIT_LO[1]) * f;
+  const b0 = GAUGE_LIT_LO[2] + (GAUGE_LIT_HI[2] - GAUGE_LIT_LO[2]) * f;
+  let r = r0, g = g0, b = b0;
+  if (f > GAUGE_HEAT){
+    const heat = (f - GAUGE_HEAT) / (1 - GAUGE_HEAT);
+    r = r0 + (GAUGE_RED[0] - r0) * heat;
+    g = g0 + (GAUGE_RED[1] - g0) * heat;
+    b = b0 + (GAUGE_RED[2] - b0) * heat;
   }
-  return GAUGE_DIM;
+  const hex = ((Math.round(r)<<16) | (Math.round(g)<<8) | Math.round(b)).toString(16).padStart(6,"0");
+  return `#${hex}`;
 }
 
 function gauge(val, max){
@@ -472,11 +871,17 @@ function gauge(val, max){
   return `<svg class="gauge" viewBox="0 0 ${GAUGE_W} ${GAUGE_H}" preserveAspectRatio="none">${rects}</svg>`;
 }
 
-// Gauge scales: chosen so a typical-load chassis sits ~40-60%, leaving room
-// for the gradient to communicate "headroom" vs "approaching limit."
-const GAUGE_MAX_CPU   = 400;   // 4 fully-saturated cores
-const GAUGE_MAX_MEM   = 100;   // % of host
-const GAUGE_MAX_TOOLS = 50;    // calls/hr is "busy"
+// Tool-calls gauge max is a heuristic ("busy" threshold); CPU/mem gauges
+// scale dynamically against the container's actual ceiling — see renderStats.
+const GAUGE_MAX_TOOLS = 50;
+
+function fmtBytes(b){
+  if(!b || b <= 0) return "—";
+  const units = ['B','KiB','MiB','GiB','TiB'];
+  let v = b, i = 0;
+  while (v >= 1024 && i < units.length-1){ v /= 1024; i++; }
+  return v >= 100 ? `${v.toFixed(0)} ${units[i]}` : `${v.toFixed(1)} ${units[i]}`;
+}
 
 function relTime(iso){
   if(!iso) return "—";
@@ -494,19 +899,47 @@ function relTime(iso){
 function renderTopBar(c){
   document.getElementById("chassis-name").textContent = c ? "· " + c.name : "";
   const pill = document.getElementById("chassis-pill");
-  if (c) { pill.textContent = c.status || "unknown"; pill.hidden = false; }
-  else { pill.hidden = true; }
-  const CFG_FIELDS = ["harness", "model", "source"];
-  const cfgItems = c ? CFG_FIELDS
-    .filter(k => c[k])
-    .map(k => `<div class="cfg"><span class="cfg-k">${k}</span><span>${escape(c[k])}</span></div>`) : [];
-  document.getElementById("topconfig").innerHTML = cfgItems.join("");
+  if (c) {
+    let txt = c.status_line || c.status || "unknown";
+    if (c.restart_count) txt += ` · ${c.restart_count} restart${c.restart_count === 1 ? "" : "s"}`;
+    pill.textContent = txt;
+    pill.hidden = false;
+  } else { pill.hidden = true; }
+  // Show 1-2 inline config items in the topbar so the most-asked-about runtime
+  // facts (model, thinking level) are visible without a click; clicking the
+  // strip opens the full Configuration modal.
+  const cfg = (c && c.config) || {};
+  lastConfig = cfg;
+  const inline = [];
+  if (cfg.model) inline.push(['model', cfg.model]);
+  if (cfg.thinking) inline.push(['thinking', cfg.thinking]);
+  const items = inline.map(([k, v]) => `<div class="cfg"><span class="cfg-k">${k}</span><span>${escape(v)}</span></div>`);
+  const hasMore = Object.keys(cfg).length > inline.length;
+  if (items.length || hasMore){
+    items.push(`<span class="cfg-more">cfg ▸</span>`);
+  }
+  document.getElementById("topconfig").innerHTML = items.join("");
 }
 
 function renderStats(c){
   const stats = c.stats || {};
+  const limits = c.limits || {};
   const cpu = parseNum(stats.cpu);
   const mem = parseNum(stats.mem_pct);
+  // docker stats CPUPerc is "cores × 100"; gauge max scales to the container's
+  // CPU ceiling. mem_pct is already 0–100 against the container's mem ceiling.
+  const cores = limits.cpu_cores || 0;
+  const cpuMax = cores > 0 ? cores * 100 : 100;
+  // "host" means there's no container-level limit and we've scaled the
+  // ceiling to HOST_FALLBACK_FRACTION (50%) of host capacity — say so
+  // explicitly so the gauge's meaning is unambiguous.
+  const hostNote = " (50% of host)";
+  const cpuLabel = cores > 0
+    ? `of ${cores < 10 ? cores.toFixed(1) : cores.toFixed(0)} ${cores === 1 ? "core" : "cores"}${limits.cpu_source === "host" ? hostNote : ""}`
+    : "—";
+  const memLabel = limits.mem_bytes
+    ? `of ${fmtBytes(limits.mem_bytes)}${limits.mem_source === "host" ? hostNote : ""}`
+    : "—";
   const hourAgo = Date.now() - 3600*1000;
   const audit = c.audit || [];
   const toolsHour = audit.filter(e => { const t = Date.parse(e.ts); return t && t >= hourAgo; }).length;
@@ -520,22 +953,19 @@ function renderStats(c){
       <div class="stat">
         <div class="label">cpu</div>
         <div class="value">${cpu.toFixed(1)}<span class="sub"> %</span></div>
-        ${gauge(cpu, GAUGE_MAX_CPU)}
+        <div class="sub" style="color:var(--text-3);font-size:10.5px">${escape(cpuLabel)}</div>
+        ${gauge(cpu, cpuMax)}
       </div>
       <div class="stat">
         <div class="label">memory</div>
-        <div class="value">${mem.toFixed(1)}<span class="sub"> % host</span></div>
-        ${gauge(mem, GAUGE_MAX_MEM)}
+        <div class="value">${mem.toFixed(1)}<span class="sub"> %</span></div>
+        <div class="sub" style="color:var(--text-3);font-size:10.5px">${escape(memLabel)}</div>
+        ${gauge(mem, 100)}
       </div>
       <div class="stat">
         <div class="label">tool calls (1h)</div>
         <div class="value">${toolsHour}${denyHour ? ` <span class="sub">· ${denyHour} bad</span>` : ""}</div>
         ${gauge(toolsHour, GAUGE_MAX_TOOLS)}
-      </div>
-      <div class="stat">
-        <div class="label">uptime</div>
-        <div class="value">${escape(c.status_line || "")}</div>
-        <div class="sub" style="color:#6e7681;font-size:10.5px">restarts ${c.restart_count ?? 0}</div>
       </div>
     </div>`;
 }
@@ -546,37 +976,387 @@ function renderAgents(chassis, agents){
     const r = a.last_run;
     const when = r ? escape(relTime(new Date(r.mtime*1000).toISOString())) : '<span class="empty">never</span>';
     const task = r ? (r.task ? `<code>${escape(r.task)}</code>` : '<span class="empty">interactive</span>') : '';
-    return `<tr class="clickable" data-chassis="${escape(chassis)}" data-agent="${escape(a.name)}"><td class="k">${escape(a.name)}</td><td>${task}</td><td>${when}</td></tr>`;
+    const live = a.running ? '<span class="dot running" style="margin-right:6px;vertical-align:middle"></span>' : '';
+    return `<tr class="clickable" data-chassis="${escape(chassis)}" data-agent="${escape(a.name)}"><td class="k">${live}${escape(a.name)}</td><td>${task}</td><td>${when}</td></tr>`;
   }).join("") + '</table>';
 }
 
-function renderCron(jobs){
+// Lay tasks out in columns by "depth from a cron source," then reorder within
+// each column to minimize edge crossings (barycenter heuristic). Cron-driven
+// nodes are pinned at depth 0 so a `cron + on_failure` task doesn't drift
+// right across cycle iterations. Pure cycles (no cron anchor) settle at
+// adjacent columns thanks to the small depth cap.
+function layoutTasks(tasks){
+  const byKey = new Map();
+  tasks.forEach(t => byKey.set(`${t.agent}/${t.task}`, {...t, key:`${t.agent}/${t.task}`}));
+
+  // children[src] = [dst, ...] for forward + backward lookups during
+  // barycentric reordering. Each task has at most one trigger (one incoming
+  // edge), so the inverse map only needs to track destinations.
+  const children = new Map();
+  for (const t of byKey.values()) children.set(t.key, []);
+  for (const t of byKey.values()){
+    if (!t.trigger) continue;
+    const sk = `${t.trigger.agent}/${t.trigger.task}`;
+    if (byKey.has(sk)) children.get(sk).push(t.key);
+  }
+
+  // Depth: cron-driven nodes anchor at 0 and never bump (so a cycle's
+  // back-edge doesn't push its anchor rightward). DEPTH_CAP keeps pure-cycle
+  // pairs from drifting — at cap=4 a 2-node cycle lands at columns (1, 2)
+  // with one back-edge, which renders as a clean adjacent-loop.
+  const DEPTH_CAP = 4;
+  const anchor = new Set();
+  for (const t of byKey.values()) if (t.cron) anchor.add(t.key);
+  const depth = new Map();
+  for (const t of byKey.values()) depth.set(t.key, 0);
+  for (let iter = 0; iter < DEPTH_CAP * 2; iter++){
+    let changed = false;
+    for (const t of byKey.values()){
+      if (anchor.has(t.key)) continue;
+      if (!t.trigger) continue;
+      const sk = `${t.trigger.agent}/${t.trigger.task}`;
+      if (!byKey.has(sk)) continue;
+      const want = depth.get(sk) + 1;
+      if (want > depth.get(t.key) && want < DEPTH_CAP){
+        depth.set(t.key, want);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+
+  // Bucket into columns, alphabetical within for stability before reorder.
+  const cols = new Map();
+  for (const t of byKey.values()){
+    const d = depth.get(t.key);
+    if (!cols.has(d)) cols.set(d, []);
+    cols.get(d).push(t);
+  }
+  for (const arr of cols.values()) arr.sort((a, b) => a.key.localeCompare(b.key));
+  const sortedDepths = [...cols.keys()].sort((a, b) => a - b);
+
+  // Barycentric crossing minimization. Sweep columns L→R then R→L for a few
+  // iterations; each pass reorders nodes by mean index of their neighbors in
+  // the reference column. Nodes with no neighbors in the reference column
+  // sink to the bottom (large sentinel score) so they don't fight live edges.
+  const sortByBary = (col, refCol) => {
+    const refIdx = new Map();
+    cols.get(refCol).forEach((t, i) => refIdx.set(t.key, i));
+    const upstream = refCol < col;  // reference is on src side
+    const score = (t) => {
+      const links = [];
+      if (upstream){
+        if (t.trigger){
+          const sk = `${t.trigger.agent}/${t.trigger.task}`;
+          if (refIdx.has(sk)) links.push(refIdx.get(sk));
+        }
+      } else {
+        for (const ck of children.get(t.key)){
+          if (refIdx.has(ck)) links.push(refIdx.get(ck));
+        }
+      }
+      if (!links.length) return 1e9;
+      return links.reduce((a, b) => a + b, 0) / links.length;
+    };
+    // Stable sort: tiebreak on existing index so unrelated nodes stay put.
+    const orig = cols.get(col).slice();
+    const origIdx = new Map(orig.map((t, i) => [t.key, i]));
+    cols.get(col).sort((a, b) => {
+      const sa = score(a), sb = score(b);
+      if (sa !== sb) return sa - sb;
+      return origIdx.get(a.key) - origIdx.get(b.key);
+    });
+  };
+  for (let pass = 0; pass < 3; pass++){
+    for (let i = 1; i < sortedDepths.length; i++) sortByBary(sortedDepths[i], sortedDepths[i - 1]);
+    for (let i = sortedDepths.length - 2; i >= 0; i--) sortByBary(sortedDepths[i], sortedDepths[i + 1]);
+  }
+
+  const NODE_W = 200, NODE_H = 44, COL_GAP = 110, ROW_GAP = 28;
+  // Pad the viewBox so back-edge arcs that overshoot past the rightmost node
+  // and bow above/below the first/last rows don't get clipped. Shifting node
+  // coordinates by (PAD_L, PAD_T) keeps the existing pan/zoom math simple —
+  // it still treats the viewBox as a 0-rooted rect.
+  const PAD_L = 4, PAD_T = 50, PAD_R = 170, PAD_B = 50;
+  const positioned = new Map();
+  sortedDepths.forEach((d, ci) => {
+    cols.get(d).forEach((t, ri) => {
+      positioned.set(t.key, {
+        ...t,
+        x: PAD_L + ci * (NODE_W + COL_GAP),
+        y: PAD_T + ri * (NODE_H + ROW_GAP),
+      });
+    });
+  });
+  const maxRows = Math.max(0, ...[...cols.values()].map(a => a.length));
+  const innerW = sortedDepths.length ? sortedDepths.length * (NODE_W + COL_GAP) - COL_GAP : 0;
+  const innerH = maxRows * (NODE_H + ROW_GAP) - ROW_GAP;
+  return {
+    nodes: positioned, NODE_W, NODE_H,
+    width:  PAD_L + innerW + PAD_R,
+    height: PAD_T + Math.max(innerH, 0) + PAD_B,
+  };
+}
+
+// Arrow-marker fill colors are pulled from the same palette as the .edge
+// stroke rules so the marker and line stay in sync per kind.
+const EDGE_COLORS = { after: "#808080", on_success: "#4ade80", on_failure: "#ef4444" };
+
+// Char budgets chosen so the longest "natural" labels (e.g. "⏱ */5 * * * * ·
+// next 12m ago", "↳ on_success reviewer/critique") fit inside the node at the
+// configured node width. Past these limits we ellipsize and stash the full
+// text in a <title> for native hover-tooltip.
+const TITLE_MAX_CHARS = 26;
+const SUB_MAX_CHARS   = 30;
+function truncate(s, n){ return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+
+function renderTriggers(chassis, tasks){
+  if (!tasks || !tasks.length) return '<div class="empty">no tasks found</div>';
+  const L = layoutTasks(tasks);
+  const NW = L.NODE_W, NH = L.NODE_H;
+
+  // Group outgoing edges by source. When a node has multiple outgoing edges,
+  // we distribute their attachment points along its right edge so the edges
+  // visually fan out instead of stacking on a single midpoint.
+  const outBySrc = new Map();
+  for (const dst of L.nodes.values()){
+    if (!dst.trigger) continue;
+    const src = L.nodes.get(`${dst.trigger.agent}/${dst.trigger.task}`);
+    if (!src) continue;
+    if (!outBySrc.has(src.key)) outBySrc.set(src.key, []);
+    outBySrc.get(src.key).push(dst);
+  }
+
+  // Distribute attachment Ys evenly across the middle 60% of the node so
+  // edges don't crowd the corners.
+  const attach = (src, idx, n) => {
+    if (n <= 1) return src.y + NH/2;
+    const range = NH * 0.6;
+    const start = src.y + (NH - range)/2;
+    return start + (range * idx) / (n - 1);
+  };
+
+  let edgesSvg = "";
+  for (const [srcKey, dsts] of outBySrc){
+    const src = L.nodes.get(srcKey);
+    // Sort forward edges first (by dst.y), then backward edges (by dst.y).
+    // Forward and backward edges leave different sides of src effectively,
+    // so we count them separately for attachment spacing.
+    dsts.sort((a, b) => {
+      const af = a.x > src.x, bf = b.x > src.x;
+      if (af !== bf) return af ? -1 : 1;
+      return a.y - b.y;
+    });
+    const fwd  = dsts.filter(d => d.x  >  src.x);
+    const back = dsts.filter(d => d.x <=  src.x);
+    let fi = 0, bi = 0;
+    for (const dst of dsts){
+      const isBackward = dst.x <= src.x;
+      const kind = ["after","on_success","on_failure"].includes(dst.trigger.kind) ? dst.trigger.kind : "after";
+      let d;
+      if (!isBackward){
+        // Forward edge: src right → dst left, smooth cubic Bezier. Handle
+        // length scales with both dx and |dy| so steep edges still curve
+        // gracefully instead of S-bending sharply near the endpoints.
+        const x1 = src.x + NW, y1 = attach(src, fi++, fwd.length);
+        const x2 = dst.x,      y2 = dst.y + NH/2;
+        const dxe = x2 - x1, dye = Math.abs(y2 - y1);
+        const h = Math.min(Math.max(90, dxe * 0.55 + dye * 0.35), Math.max(120, dxe * 0.9));
+        d = `M${x1},${y1} C${x1+h},${y1} ${x2-h},${y2} ${x2},${y2}`;
+      } else {
+        // Backward edge (cycle): loop on the right side of both nodes.
+        // Exits src from the right, curls around to the right, re-enters dst
+        // from the right. Keeps cycles visually distinct from forward edges
+        // and avoids crossing nodes between dst and src. When dy is tiny
+        // (same row), pulling control points purely horizontally would
+        // collapse the curve onto a flat line — bow them outward instead.
+        const x1 = src.x + NW, y1 = attach(src, bi++, back.length);
+        const x2 = dst.x + NW, y2 = dst.y + NH/2;
+        const dye = Math.abs(y2 - y1);
+        // Overshoot scales with column span so a multi-column back-edge gets a
+        // bigger swing than a tight 2-cycle; minimum keeps adjacent cycles
+        // visibly looped instead of collapsing onto a straight line.
+        const dxe = Math.abs(x1 - x2);
+        const overshoot = Math.max(80, dxe * 0.35) + dye * 0.2;
+        const hx = Math.max(x1, x2) + overshoot;
+        // When y1 ≈ y2 the curve would collapse onto a flat segment; bow the
+        // control points upward so the arc is visibly distinct.
+        const bow = dye < 8 ? 42 : 0;
+        d = `M${x1},${y1} C${hx},${y1-bow} ${hx},${y2-bow} ${x2},${y2}`;
+      }
+      edgesSvg += `<path class="edge ${kind}" d="${d}" marker-end="url(#arrow-${kind})"/>`;
+    }
+  }
+  let nodesSvg = "";
+  for (const t of L.nodes.values()){
+    const isCron   = !!t.cron;
+    const isOrphan = !isCron && !t.trigger;
+    const classes = ["node", "clickable"];
+    if (isCron) classes.push("cron");
+    else if (isOrphan) classes.push("orphan");
+    if (t.running) classes.push("running");
+    const titleRaw = `${t.agent}/${t.task}`;
+    // Build the sub line from raw values (not HTML-escaped yet) so we can
+    // truncate by character count without slicing into an entity reference.
+    let subRaw;
+    if (isCron){
+      const nx = t.next ? ` · next ${relTime(t.next)}` : "";
+      subRaw = `⏱ ${t.cron}${nx}`;
+    } else if (t.trigger){
+      const w = t.trigger.when;
+      const wTail = w ? ` [${w.key}${w.op}${w.value}]` : "";
+      subRaw = `↳ ${t.trigger.kind} ${t.trigger.agent}/${t.trigger.task}${wTail}`;
+    } else {
+      subRaw = "manual";
+    }
+    const titleDisp = truncate(titleRaw, TITLE_MAX_CHARS);
+    const subDisp   = truncate(subRaw,   SUB_MAX_CHARS);
+    // Full text in the <title> so hover always reveals what was truncated;
+    // also useful when the user wants to read a long cron expression.
+    const tooltip = `${titleRaw}\n${subRaw}`;
+    nodesSvg += `
+      <g class="${classes.join(' ')}" data-chassis="${escape(chassis)}" data-agent="${escape(t.agent)}" data-task="${escape(t.task)}" transform="translate(${t.x},${t.y})">
+        <title>${escape(tooltip)}</title>
+        <rect width="${NW}" height="${NH}" rx="6"/>
+        <text class="title" x="10" y="18">${escape(titleDisp)}</text>
+        <text class="sub"   x="10" y="33">${escape(subDisp)}</text>
+      </g>`;
+  }
+  const markers = ["after","on_success","on_failure"].map(k => `
+    <marker id="arrow-${k}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="${EDGE_COLORS[k]}"/>
+    </marker>`).join("");
+  return `
+    <div class="graph-wrap">
+      <svg class="graph" viewBox="0 0 ${L.width} ${L.height}" data-nat-w="${L.width}" data-nat-h="${L.height}" preserveAspectRatio="xMidYMid meet">
+        <defs>${markers}</defs>
+        ${edgesSvg}
+        ${nodesSvg}
+      </svg>
+    </div>
+    <div class="graph-legend">
+      <span><span class="swatch" style="background:${EDGE_COLORS.on_success}"></span>on_success</span>
+      <span><span class="swatch" style="background:${EDGE_COLORS.after}"></span>after</span>
+      <span><span class="swatch" style="background:${EDGE_COLORS.on_failure}"></span>on_failure / running</span>
+      <span><span class="swatch" style="background:var(--text-1)"></span>cron-rooted</span>
+      <span><span class="swatch dashed"></span>manual (no cron, no trigger)</span>
+    </div>`;
+}
+
+// Vertical 24h agenda of cron fires across all jobs, in chronological order.
+// Band headers (now / +6h / +12h / +18h / +24h) render lazily as the timeline
+// crosses each boundary, so empty bands don't take up space.
+function fmtUntil(iso){
+  const t = Date.parse(iso); if (!t) return iso;
+  const diff = Math.max(0, Math.floor((t - Date.now()) / 1000));
+  if (diff < 60) return `in ${diff}s`;
+  const m = Math.floor(diff / 60);
+  if (m < 60) return `in ${m}m`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  return rm ? `in ${h}h ${rm}m` : `in ${h}h`;
+}
+
+function renderSchedule(jobs){
   if (!jobs || !jobs.length) return '<div class="empty">no cron jobs</div>';
-  return '<table>' + jobs.map(j => {
-    const next = j.next ? escape(relTime(j.next)) : '<span class="empty">—</span>';
-    return `<tr><td class="k">${escape(j.schedule)}</td><td>${escape(j.command)}</td><td>${next}</td></tr>`;
-  }).join("") + '</table>';
+  const WINDOW_MS = 24 * 3600 * 1000;
+  const now = Date.now();
+  const events = [];
+  for (const j of jobs){
+    const fires = (j.next_fires && j.next_fires.length) ? j.next_fires : (j.next ? [j.next] : []);
+    for (const iso of fires){
+      const t = Date.parse(iso);
+      if (!t || t < now || t - now > WINDOW_MS) continue;
+      events.push({ t, iso, label: j.command || j.schedule, schedule: j.schedule });
+    }
+  }
+  if (!events.length) return '<div class="empty">no fires in the next 24h</div>';
+  events.sort((a, b) => a.t - b.t);
+  const BANDS = [
+    { ms: 0,            label: 'now'  },
+    { ms: 6  * 3600000, label: '+6h'  },
+    { ms: 12 * 3600000, label: '+12h' },
+    { ms: 18 * 3600000, label: '+18h' },
+  ];
+  let html = '<div class="agenda">';
+  let bandIdx = 0;
+  html += `<div class="agenda-band">${BANDS[0].label}</div>`;
+  bandIdx = 1;
+  for (const ev of events){
+    const elapsed = ev.t - now;
+    while (bandIdx < BANDS.length && elapsed >= BANDS[bandIdx].ms){
+      html += `<div class="agenda-band">${BANDS[bandIdx].label}</div>`;
+      bandIdx++;
+    }
+    html += `
+      <div class="agenda-row">
+        <span class="agenda-when">${escape(fmtUntil(ev.iso))}</span>
+        <span class="agenda-label" title="${escape(ev.schedule)}">${escape(ev.label)}</span>
+      </div>`;
+  }
+  html += `<div class="agenda-band">+24h</div>`;
+  html += '</div>';
+  return html;
 }
 
-function renderAudit(audit){
-  if (!audit || !audit.length) return '<div class="empty">no audit entries</div>';
-  return audit.map(e => {
-    const bad = e.status === "denied" || (e.exit && e.exit !== 0);
-    const note = bad ? ` ✗ ${escape(e.reason || "exit " + e.exit)}` : "";
-    return `<div class="line clickable ${bad ? "deny" : ""}" data-audit="${escape(JSON.stringify(e))}"><span class="ts">${escape(relTime(e.ts))}</span> ${escape(e.tool)}${note}</div>`;
+// Merged audit + fires, sorted newest-first. Each row is tagged with a
+// "tool" or "fire" badge so the source is unambiguous. Tool rows are
+// clickable and open the audit-entry JSON modal; fire rows are static.
+function renderEvents(audit, fires){
+  audit = audit || [];
+  fires = fires || [];
+  const events = [];
+  for (const e of audit){
+    events.push({ ts: e.ts, kind: 'tool', bad: e.status === "denied" || (e.exit && e.exit !== 0), data: e });
+  }
+  for (const f of fires){
+    events.push({ ts: f.ts, kind: 'fire', bad: f.rc !== 0, data: f });
+  }
+  if (!events.length) return '<div class="empty">no events</div>';
+  events.sort((a, b) => (Date.parse(b.ts) || 0) - (Date.parse(a.ts) || 0));
+  return events.slice(0, 40).map(ev => {
+    const when = `<span class="ts">${escape(relTime(ev.ts))}</span>`;
+    const kind = `<span class="ev-kind">${ev.kind}</span>`;
+    if (ev.kind === 'tool'){
+      const e = ev.data;
+      const note = ev.bad ? ` ✗ ${escape(e.reason || "exit " + e.exit)}` : "";
+      return `<div class="line clickable ${ev.bad ? "deny" : ""}" data-audit="${escape(JSON.stringify(e))}">${when} ${kind}${escape(e.tool)}${note}</div>`;
+    }
+    const f = ev.data;
+    const arrow = `<span style="color:${EDGE_COLORS[f.kind] || EDGE_COLORS.after}">→</span>`;
+    // The verdict snapshot answers "why did this branch fire?" — surface it
+    // inline so the operator doesn't have to grep triggers.log. The `when`
+    // clause (if any) appears on the right of the arrow next to its dst, so
+    // the routing rule reads left-to-right with the destination.
+    const verdict = f.verdict && Object.keys(f.verdict).length
+      ? ` <span class="pill" style="color:var(--text-3)">${escape(Object.entries(f.verdict).map(([k,v]) => `${k}=${v}`).join(','))}</span>`
+      : "";
+    const wTail = f.when
+      ? ` <span class="pill" style="color:var(--text-3)">when ${escape(f.when.key)} ${escape(f.when.op)} ${escape(f.when.value)}</span>`
+      : "";
+    return `<div class="line ${ev.bad ? 'deny' : ''}">${when} ${kind}${escape(f.src_agent)}/${escape(f.src_task)} <span class="pill${ev.bad ? ' bad' : ''}">${escape(f.kind)}${ev.bad ? ' rc=' + f.rc : ''}</span>${verdict} ${arrow} ${escape(f.dst_agent)}/${escape(f.dst_task)}${wTail}</div>`;
   }).join("");
 }
 
 function renderPage(c){
   if (!c.running){
-    return `${renderStats(c)}<div class="block"><div class="empty">chassis is not running</div></div>`;
+    return `${renderStats(c)}<div class="block"><div class="block-body"><div class="empty">chassis is not running</div></div></div>`;
   }
+  // Every block wraps its content in .block-body so that's what scrolls
+  // when the cell can't grow further (page itself never scrolls on wide).
   return `
     ${renderStats(c)}
-    <div class="blocks">
-      <div class="block"><h3>agents</h3>${renderAgents(c.name, c.agents)}</div>
-      <div class="block"><h3>cron</h3>${renderCron(c.cron)}</div>
-      <div class="block"><h3>recent tools</h3>${renderAudit(c.audit)}</div>
+    <div class="main">
+      <div class="main-left">
+        <div class="block hero-graph"><h3>triggers</h3><div class="block-body">${renderTriggers(c.name, c.tasks)}</div></div>
+        <div class="blocks">
+          <div class="block"><h3>agents</h3><div class="block-body">${renderAgents(c.name, c.agents)}</div></div>
+          <div class="block"><h3>events</h3><div class="block-body">${renderEvents(c.audit, c.fires)}</div></div>
+        </div>
+      </div>
+      <div class="main-right">
+        <div class="block"><h3>schedule</h3><div class="block-body">${renderSchedule(c.cron)}</div></div>
+      </div>
     </div>`;
 }
 
@@ -591,23 +1371,71 @@ function showAudit(e){
   const bad=e.status==="denied"||(e.exit&&e.exit!==0);
   openModal(`${e.tool} · ${bad?(e.status==="denied"?"denied":"exit "+e.exit):"ok"}`,`<pre>${escape(JSON.stringify(e,null,2))}</pre>`);
 }
-async function showAgent(chassis,agent){
-  openModal(`${chassis} · ${agent}`,'<div class="empty">loading…</div>');
+// Both drill-ins (showAgent: all tasks for an agent; showTask: a single task)
+// share the same row format. Differences: URL (?task= filter), modal title,
+// and the "task" column is dropped when the modal is already scoped to one.
+async function renderRunsModal(chassis, title, url, includeTaskCol){
+  openModal(title, '<div class="empty">loading…</div>');
   try{
-    const r=await fetch(`/api/runs/${encodeURIComponent(chassis)}/${encodeURIComponent(agent)}?limit=20`);
-    const runs=await r.json();
-    if(!runs.length){ document.querySelector('.modal-content').innerHTML='<div class="empty">no runs recorded</div>'; return; }
-    const rows=runs.map(r=>{
-      const when=escape(relTime(new Date(r.mtime*1000).toISOString()));
-      const task=r.task?`<code>${escape(r.task)}</code>`:'<span class="empty">interactive</span>';
-      const sess=r.session_file?`<a class="link" data-session="${escape(r.session_file)}" data-chassis="${escape(chassis)}">session</a>`:'<span class="empty">—</span>';
-      const log=`<a class="link" data-file="${escape(r.path)}" data-chassis="${escape(chassis)}">run log</a>`;
-      return `<tr><td class="k">${when}</td><td>${task}</td><td>${log}</td><td>${sess}</td></tr>`;
+    const r = await fetch(url);
+    const runs = await r.json();
+    if(!runs.length){
+      document.querySelector('.modal-content').innerHTML='<div class="empty">no runs recorded</div>';
+      return;
+    }
+    const rows = runs.map(rec => {
+      const when = escape(relTime(new Date(rec.mtime*1000).toISOString()));
+      const task = rec.task ? `<code>${escape(rec.task)}</code>` : '<span class="empty">interactive</span>';
+      const sess = rec.session_file ? `<a class="link" data-session="${escape(rec.session_file)}" data-chassis="${escape(chassis)}">session</a>` : '<span class="empty">—</span>';
+      const log  = `<a class="link" data-file="${escape(rec.path)}" data-chassis="${escape(chassis)}">run log</a>`;
+      return includeTaskCol
+        ? `<tr><td class="k">${when}</td><td>${task}</td><td>${log}</td><td>${sess}</td></tr>`
+        : `<tr><td class="k">${when}</td><td>${log}</td><td>${sess}</td></tr>`;
     }).join("");
-    document.querySelector('.modal-content').innerHTML=`<table><thead><tr><td class="k">when</td><td class="k">task</td><td class="k">run log</td><td class="k">pi session</td></tr></thead>${rows}</table>`;
+    const head = includeTaskCol
+      ? `<thead><tr><td class="k">when</td><td class="k">task</td><td class="k">run log</td><td class="k">pi session</td></tr></thead>`
+      : `<thead><tr><td class="k">when</td><td class="k">run log</td><td class="k">pi session</td></tr></thead>`;
+    document.querySelector('.modal-content').innerHTML = `<table>${head}${rows}</table>`;
   }catch(err){
-    document.querySelector('.modal-content').innerHTML=`<div class="empty">fetch error: ${escape(err.message)}</div>`;
+    document.querySelector('.modal-content').innerHTML = `<div class="empty">fetch error: ${escape(err.message)}</div>`;
   }
+}
+async function showAgent(chassis,agent){
+  await renderRunsModal(
+    chassis,
+    `${chassis} · ${agent}`,
+    `/api/runs/${encodeURIComponent(chassis)}/${encodeURIComponent(agent)}?limit=20`,
+    true,
+  );
+}
+async function showTask(chassis,agent,task){
+  await renderRunsModal(
+    chassis,
+    `${chassis} · ${agent}/${task}`,
+    `/api/runs/${encodeURIComponent(chassis)}/${encodeURIComponent(agent)}?task=${encodeURIComponent(task)}&limit=20`,
+    false,
+  );
+}
+// The configuration object rides on the snapshot, so this is a no-fetch modal.
+function showConfig(){
+  if (!lastConfig || !Object.keys(lastConfig).length){
+    openModal('configuration', '<div class="empty">no configuration available</div>');
+    return;
+  }
+  const LABELS = {
+    model: "model",
+    context_window: "context window",
+    max_tokens: "max tokens",
+    thinking: "thinking",
+    api_kind: "api kind",
+    base_url: "base url",
+    harness: "harness",
+  };
+  const rows = Object.entries(LABELS)
+    .filter(([k]) => lastConfig[k])
+    .map(([k, label]) => `<dt>${escape(label)}</dt><dd>${escape(lastConfig[k])}</dd>`)
+    .join("");
+  openModal('configuration', `<dl class="kv">${rows}</dl>`);
 }
 async function showFile(chassis,path,title){
   const backHTML=`<a class="back" id="modal-back">← back</a>`;
@@ -616,33 +1444,144 @@ async function showFile(chassis,path,title){
     const r=await fetch(`/api/file/${encodeURIComponent(chassis)}?path=${encodeURIComponent(path)}`);
     const j=await r.json();
     if(j.error){ document.querySelector('.modal-content').innerHTML=backHTML+`<div class="empty">${escape(j.error)}</div>`; return; }
-    document.querySelector('.modal-content').innerHTML=backHTML+`<div style="color:#6e7681;margin-bottom:6px">${escape(path)}</div><pre>${escape(j.content||"(empty)")}</pre>`;
+    document.querySelector('.modal-content').innerHTML=backHTML+`<div style="color:var(--text-3);margin-bottom:6px">${escape(path)}</div><pre>${escape(j.content||"(empty)")}</pre>`;
   }catch(err){
     document.querySelector('.modal-content').innerHTML=backHTML+`<div class="empty">fetch error: ${escape(err.message)}</div>`;
   }
 }
+function reopenLastDrill(){
+  if(!lastDrillCtx) return;
+  if(lastDrillCtx.task) showTask(lastDrillCtx.chassis, lastDrillCtx.agent, lastDrillCtx.task);
+  else showAgent(lastDrillCtx.chassis, lastDrillCtx.agent);
+}
 document.addEventListener('click',e=>{
+  // Pan handler sets this after a meaningful drag so the synthetic click that
+  // follows mouseup doesn't open a drill-in modal for the node we ended on.
+  if(suppressNextClick){ suppressNextClick=false; return; }
   if(e.target.matches('.modal-backdrop, .modal-close')){ closeModal(); return; }
   if(e.target.id==='modal-back' || e.target.classList.contains('back')){
-    if(lastAgentCtx){ showAgent(lastAgentCtx.chassis,lastAgentCtx.agent); }
+    reopenLastDrill();
     return;
   }
+  if(e.target.closest('#topconfig')){ showConfig(); return; }
   const sess=e.target.closest('[data-session]');
   if(sess){ showFile(sess.dataset.chassis,sess.dataset.session,'pi session'); return; }
   const file=e.target.closest('[data-file]');
   if(file){ showFile(file.dataset.chassis,file.dataset.file,'run log'); return; }
   const audit=e.target.closest('[data-audit]');
   if(audit){ try{ showAudit(JSON.parse(audit.dataset.audit)); }catch(_){} return; }
-  const agentRow=e.target.closest('[data-agent]');
-  if(agentRow){ lastAgentCtx={chassis:agentRow.dataset.chassis,agent:agentRow.dataset.agent}; showAgent(lastAgentCtx.chassis,lastAgentCtx.agent); }
+  // A graph node has both data-agent and data-task; an agent row has only
+  // data-agent. Same handler, two scopes — task drill wins when present.
+  const target=e.target.closest('[data-agent]');
+  if(target){
+    const t = target.dataset.task || null;
+    lastDrillCtx = { chassis: target.dataset.chassis, agent: target.dataset.agent, task: t };
+    if(t) showTask(lastDrillCtx.chassis, lastDrillCtx.agent, t);
+    else  showAgent(lastDrillCtx.chassis, lastDrillCtx.agent);
+  }
 });
 document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
-let lastAgentCtx=null;
+let lastDrillCtx=null;
+let lastConfig=null;
+let serverBoot=null;
+let suppressNextClick=false;
+// Persisted SVG viewBox state. Reset to natural bounds on each render until
+// the user pans or zooms — after that, we preserve their view across the
+// 3-second auto-refresh so the dashboard doesn't snap back on every tick.
+let graphVB=null;
+let graphInteracted=false;
+
+function attachGraphPanZoom(){
+  const svg = document.querySelector('.hero-graph .graph');
+  if(!svg) return;
+  const natW = parseFloat(svg.getAttribute('data-nat-w'));
+  const natH = parseFloat(svg.getAttribute('data-nat-h'));
+  if(!Number.isFinite(natW) || !Number.isFinite(natH)) return;
+  if(!graphInteracted || !graphVB){
+    graphVB = { x: 0, y: 0, w: natW, h: natH };
+  }
+  const applyVB = () => svg.setAttribute('viewBox',
+    `${graphVB.x} ${graphVB.y} ${graphVB.w} ${graphVB.h}`);
+  applyVB();
+
+  let panning = false;
+  let panStart = null;
+  svg.addEventListener('mousedown', (e) => {
+    if(e.button !== 0) return;
+    // Clicking a node should still drill in; only pan from empty space.
+    if(e.target.closest('.node')) return;
+    e.preventDefault();
+    panning = true;
+    const rect = svg.getBoundingClientRect();
+    panStart = {
+      clientX: e.clientX, clientY: e.clientY,
+      vbX: graphVB.x, vbY: graphVB.y,
+      // CSS px → viewBox unit conversion; matches `xMidYMid meet` so the
+      // factor is the smaller of the two axis ratios when aspect differs.
+      scale: Math.max(graphVB.w / rect.width, graphVB.h / rect.height),
+      moved: 0,
+    };
+    svg.classList.add('panning');
+  });
+  document.addEventListener('mousemove', (e) => {
+    if(!panning) return;
+    const dx = e.clientX - panStart.clientX;
+    const dy = e.clientY - panStart.clientY;
+    panStart.moved += Math.abs(dx) + Math.abs(dy);
+    graphVB.x = panStart.vbX - dx * panStart.scale;
+    graphVB.y = panStart.vbY - dy * panStart.scale;
+    if(panStart.moved > 3) graphInteracted = true;
+    applyVB();
+  });
+  document.addEventListener('mouseup', () => {
+    if(!panning) return;
+    panning = false;
+    svg.classList.remove('panning');
+    if(panStart && panStart.moved > 3) suppressNextClick = true;
+    panStart = null;
+  });
+
+  svg.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    // Pin the point under the cursor: convert mouse px → viewBox coords,
+    // scale the viewBox, then shift x/y so the same vb point still maps to
+    // the same cursor px.
+    const vbMx = graphVB.x + (mx / rect.width)  * graphVB.w;
+    const vbMy = graphVB.y + (my / rect.height) * graphVB.h;
+    const factor = e.deltaY < 0 ? 1/1.15 : 1.15;
+    const newW = graphVB.w * factor;
+    // Clamp: 0.15× natural (zoomed in tight) to 6× natural (zoomed way out).
+    if(newW < natW * 0.15 || newW > natW * 6) return;
+    graphVB.w = newW;
+    graphVB.h *= factor;
+    graphVB.x = vbMx - (mx / rect.width)  * graphVB.w;
+    graphVB.y = vbMy - (my / rect.height) * graphVB.h;
+    graphInteracted = true;
+    applyVB();
+  }, { passive: false });
+
+  svg.addEventListener('dblclick', (e) => {
+    if(e.target.closest('.node')) return;
+    graphVB = { x: 0, y: 0, w: natW, h: natH };
+    graphInteracted = false;
+    applyVB();
+  });
+}
 
 async function tick(){
   try{
     const r=await fetch("/api/state");
     const data=await r.json();
+    // Auto-refresh on server restart (uvicorn --reload). The boot timestamp
+    // changes on each subprocess restart, so a mismatch means the embedded
+    // HTML/JS is stale and we should pick up the new copy.
+    if(data.server_boot){
+      if(serverBoot===null) serverBoot=data.server_boot;
+      else if(serverBoot!==data.server_boot){ location.reload(); return; }
+    }
     const page=document.getElementById("page");
     if(data.error || !data.chassis){
       renderTopBar(null);
@@ -651,6 +1590,7 @@ async function tick(){
       renderTopBar(data.chassis);
       document.title = `chassis · ${data.chassis.name}`;
       page.innerHTML = renderPage(data.chassis);
+      attachGraphPanZoom();
     }
     document.getElementById("age").textContent="updated "+relTime(data.generated_at);
   }catch(e){
@@ -679,10 +1619,31 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--chassis", default=None, help="Container name to monitor. Defaults to the only chassis container running.")
+    ap.add_argument("--reload", action="store_true", help="Dev mode: restart the server when app.py changes; the browser auto-refreshes on the next poll.")
     args = ap.parse_args()
     CHASSIS_NAME = args.chassis
+    if args.chassis:
+        # Reload subprocess re-imports the module instead of running main(),
+        # so propagate the chosen chassis through the environment.
+        os.environ["CHASSIS_NAME"] = args.chassis
     import uvicorn
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    if args.reload:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # uvicorn's reloader needs an import string and a Python path that
+        # can resolve it. The reload subprocess inherits this env var.
+        os.environ["PYTHONPATH"] = (
+            script_dir + os.pathsep + os.environ.get("PYTHONPATH", "")
+        ).rstrip(os.pathsep)
+        uvicorn.run(
+            "app:app",
+            host=args.host,
+            port=args.port,
+            reload=True,
+            reload_dirs=[script_dir],
+            log_level="warning",
+        )
+    else:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

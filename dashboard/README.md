@@ -20,6 +20,7 @@ so [uv](https://docs.astral.sh/uv/) handles them automatically:
 ./app.py                         # http://127.0.0.1:8765
 ./app.py --chassis my-chassis    # explicit target
 ./app.py --host 0.0.0.0 --port 9000
+./app.py --reload                # dev: restart on app.py changes, browser auto-refreshes
 ```
 
 The chassis is auto-picked when exactly one container with a
