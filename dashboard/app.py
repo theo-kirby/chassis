@@ -378,7 +378,11 @@ async def task_graph(container: str) -> list[dict]:
         "  agent=$(basename \"$(dirname \"$d\")\"); "
         "  cron=$(grep -v '^[[:space:]]*#' \"$d/cron\" 2>/dev/null | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[[:space:]]*//'); "
         "  trig=$(grep -v '^[[:space:]]*#' \"$d/trigger\" 2>/dev/null | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[[:space:]]*//'); "
-        "  printf '%s\\t%s\\t%s\\t%s\\n' \"$agent\" \"$task\" \"$cron\" \"$trig\"; "
+        # Per-task last-run mtime drives the dashboard's recency glow. Same shape
+        # as agent_last_run's find, scoped to this (agent,task) only.
+        "  last=$(find /var/log/chassis/agents/$agent/$task -type f -name '*.jsonl' "
+        "    -printf '%T@\\n' 2>/dev/null | sort -n | tail -1); "
+        "  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$agent\" \"$task\" \"$cron\" \"$trig\" \"$last\"; "
         "done",
     )
     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -388,6 +392,12 @@ async def task_graph(container: str) -> list[dict]:
         if len(parts) < 4:
             continue
         agent, task, cron_line, trig_line = parts[0], parts[1], parts[2] or None, parts[3] or None
+        last_run_ts: float | None = None
+        if len(parts) >= 5 and parts[4]:
+            try:
+                last_run_ts = float(parts[4])
+            except ValueError:
+                pass
         next_fire = None
         if cron_line and croniter:
             try:
@@ -414,6 +424,7 @@ async def task_graph(container: str) -> list[dict]:
             "cron": cron_line,
             "next": next_fire,
             "trigger": trigger,
+            "last_run_ts": last_run_ts,
         })
     tasks.sort(key=lambda t: (t["agent"], t["task"]))
     return tasks
@@ -663,40 +674,65 @@ INDEX_HTML = r"""<!doctype html>
 <style>
   :root {
     color-scheme: dark;
-    --bg-base:   #0a0a0a;
-    --bg-card:   #141414;
-    --bg-sub:    #1c1c1c;
-    --bg-hover:  #222222;
-    --border-1:  #2a2a2a;
-    --border-2:  #3a3a3a;
-    --text-1:    #f5f5f5;
-    --text-2:    #b8b8b8;
-    --text-3:    #808080;
-    --text-4:    #555555;
+    /* Neutral-grey charcoal palette (R = G = B at every step) — no blue cast.
+       Step sizes preserve clear separation between background, card surface,
+       and the hero block. */
+    --bg-topbar:     #050505;
+    --bg-base:       #0c0c0c;
+    --bg-card:       #181818;
+    --bg-sub:        #242424;   /* pill surface */
+    --bg-input:      #0a0a0a;   /* deep-recessed (code wells) */
+    --bg-hover:      #2a2a2a;
+    --border-1:      #262626;
+    --border-2:      #3a3a3a;
+    --text-1:    #f0f0f0;
+    --text-2:    #c6c6c6;
+    --text-3:    #8a8a8a;
+    --text-4:    #5a5a5a;
+    /* Brand: chassis red (logo, .name, badges, "running" pulse, brand hover).
+       Distinct from error states so they don't read as failures. */
     --red:       #ef4444;
     --red-soft:  #fca5a5;
     --red-dim:   #5a1a1a;
-    --green:     #4ade80;
+    /* Error / failure / denial — warm amber. Separated from brand so a failed
+       on_failure edge doesn't compete with the brand wordmark or the running
+       pulse, and so the operator can scan "something went wrong" at a glance. */
+    --danger:      #f59e0b;
+    --danger-soft: #fcd34d;
+    --danger-dim:  #4a3406;
+    --green:       #4ade80;
   }
   html, body { height:100%; }
   html { overflow:hidden; }
-  body { font: 12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:var(--bg-base); color:var(--text-2); margin:0; padding:0; display:flex; flex-direction:column; overflow:hidden; }
-  .topbar { display:flex; align-items:center; gap:18px; padding:8px 16px; background:#050505; border-bottom:1px solid var(--border-1); color:var(--text-1); }
-  .topbar .brand { display:flex; align-items:center; gap:8px; font-size:15px; font-weight:600; letter-spacing:.3px; }
-  .topbar .brand .car { font-size:18px; filter:saturate(1.4); }
-  .topbar .brand .name { color:var(--red); }
+  body { font: 12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    background:var(--bg-base); color:var(--text-2);
+    font-variant-numeric: tabular-nums;
+    margin:0; padding:0; display:flex; flex-direction:column; overflow:hidden; }
+  /* Bloomberg-leaning chrome: hard rules, no rounded corners, no drop shadow.
+     The topbar is the deepest tone in the palette and is separated from the
+     page by a single 1px border-2 rule. */
+  .topbar { display:flex; align-items:center; gap:16px; padding:6px 14px;
+    background:var(--bg-topbar);
+    border-bottom:1px solid var(--border-2);
+    color:var(--text-1); position:relative; z-index:1; }
+  /* Brand: red leftbar motif + car emoji + wordmark. The leftbar is a thin
+     2px rule that visually anchors the wordmark like a terminal title. */
+  .topbar .brand { display:flex; align-items:center; gap:8px; font-size:14px; font-weight:600; letter-spacing:.5px; }
+  .topbar .brand::before { content:""; display:block; width:2px; height:16px; background:var(--red); }
+  .topbar .brand .car { font-size:16px; filter:saturate(1.4); }
+  .topbar .brand .name { color:var(--red); text-transform:uppercase; }
   .topbar .brand .chassis { color:var(--text-2); font-weight:500; }
-  .topbar .config { display:flex; gap:14px; align-items:center; color:var(--text-1); font-size:11.5px; padding:4px 10px; border-left:1px solid var(--border-1); border-radius:4px; cursor:pointer; transition:background .12s; }
+  .topbar .config { display:flex; gap:14px; align-items:center; color:var(--text-1); font-size:11.5px; padding:3px 10px; border-left:1px solid var(--border-1); cursor:pointer; transition:background .12s; }
   .topbar .config:hover { background:var(--bg-hover); }
   .topbar .config:empty { display:none; }
   .topbar .config .cfg { display:flex; align-items:baseline; gap:6px; }
   .topbar .config .cfg-k { color:var(--text-3); text-transform:uppercase; font-size:10px; letter-spacing:.6px; }
   .topbar .config .cfg-more { color:var(--text-3); font-size:10px; }
-  .topbar .age { color:var(--text-3); font-size:11px; margin-left:auto; }
+  .topbar .age { color:var(--text-3); font-size:11px; margin-left:auto; font-variant-numeric:tabular-nums; }
   .page {
     flex:1 1 0;
     min-height:0;
-    padding:12px;
+    padding:8px;
     max-width:1400px;
     margin:0 auto;
     width:100%;
@@ -704,27 +740,37 @@ INDEX_HTML = r"""<!doctype html>
     display:grid;
     /* stats (auto) · main content (flex) */
     grid-template-rows: auto minmax(0,1fr);
-    gap:10px;
+    gap:6px;
     overflow:hidden;
   }
   /* Two-column body: left holds triggers above agents/events, right holds schedule. */
-  .main { display:grid; grid-template-columns: minmax(0,1fr) minmax(280px,360px); gap:10px; min-height:0; overflow:hidden; }
-  .main-left { display:grid; grid-template-rows: minmax(0,1fr) minmax(0,1fr); gap:10px; min-height:0; overflow:hidden; }
+  .main { display:grid; grid-template-columns: minmax(0,1fr) minmax(280px,360px); gap:6px; min-height:0; overflow:hidden; }
+  /* main-left is graph-over-blocks; weight 2.5:1 so the trigger graph gets
+     ~70% of vertical room. Agents/events still scroll inside their block. */
+  .main-left { display:grid; grid-template-rows: minmax(0,2.5fr) minmax(0,1fr); gap:6px; min-height:0; overflow:hidden; }
   .main-right { display:grid; grid-template-rows: minmax(0,1fr); min-height:0; overflow:hidden; }
-  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
-  .stat { background:var(--bg-card); border:1px solid var(--border-1); border-radius:6px; padding:10px 12px; display:flex; flex-direction:column; gap:4px; min-height:80px; }
-  .stat .label { color:var(--text-3); font-size:10px; text-transform:uppercase; letter-spacing:.6px; }
-  .stat .value { font-size:20px; font-weight:600; color:var(--text-1); line-height:1.15; }
-  .stat .value .sub { color:var(--text-3); font-size:11px; font-weight:400; }
-  .stat svg.gauge { display:block; width:100%; height:24px; margin-top:auto; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:6px; }
+  /* Stat tiles: flat hard-rect, no sheen, no drop shadow. Bloomberg-terminal
+     feel — the data is the foreground, the chrome is invisible. */
+  .stat { background:var(--bg-card);
+    border:1px solid var(--border-1); padding:5px 10px;
+    display:flex; flex-direction:column; gap:2px; min-height:0; }
+  .stat .label { color:var(--text-3); font-size:10px; text-transform:uppercase; letter-spacing:.8px; }
+  .stat .value { font-size:17px; font-weight:600; color:var(--text-1); line-height:1.1; font-variant-numeric:tabular-nums; }
+  .stat .value.warn { color:var(--danger-soft); }
+  .stat .value .sub { color:var(--text-3); font-size:10.5px; font-weight:400; }
+  .stat svg.gauge { display:block; width:100%; height:14px; margin-top:auto; }
   /* Each block is a grid with a fixed h3 header and a 1fr body that scrolls
    * when content overflows its grid cell — the page itself never scrolls.
    * Grid is more predictable than flex here: in a fixed-height outer row
    * (1fr) the body fills the remainder; in an auto-sized outer row the body
-   * sizes to its content without collapsing (which flex-basis:0 does). */
-  .block { background:var(--bg-card); border:1px solid var(--border-1); border-radius:6px; padding:10px 14px; min-width:0; min-height:0; display:grid; grid-template-rows:auto minmax(0,1fr); overflow:hidden; }
+   * sizes to its content without collapsing (which flex-basis:0 does).
+   * Bloomberg-flat: hard 1px borders, no rounded corners, no shadows. */
+  .block { background:var(--bg-card);
+    border:1px solid var(--border-1); padding:6px 12px 10px;
+    min-width:0; min-height:0; display:grid; grid-template-rows:auto minmax(0,1fr); overflow:hidden; }
   .block-body { min-height:0; overflow:auto; }
-  .blocks { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; min-height:0; overflow:hidden; }
+  .blocks { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; min-height:0; overflow:hidden; }
   @media (max-width: 900px) {
     /* Narrow viewports: surrender the no-scroll constraint — stack and let the page scroll. */
     html, body { overflow:auto; height:auto; }
@@ -735,29 +781,49 @@ INDEX_HTML = r"""<!doctype html>
     .block-body { overflow:visible; }
     .blocks { grid-template-columns:1fr; }
   }
-  .block h3 { margin:0 0 8px; font-size:12px; font-weight:600; color:var(--text-3); text-transform:uppercase; letter-spacing:.6px; }
+  /* Section header: brand-red square + uppercase wordmark + strong hard rule.
+     Square mark (not dot) tightens the terminal feel. */
+  .block h3 { margin:0 0 8px; padding-bottom:5px;
+    border-bottom:1px solid var(--border-2);
+    font-size:11px; font-weight:700; color:var(--text-1);
+    text-transform:uppercase; letter-spacing:1px;
+    display:flex; align-items:center; gap:7px; }
+  .block h3::before { content:""; width:6px; height:6px;
+    background:var(--red); box-shadow:0 0 6px rgba(239,68,68,0.55); flex:none; }
   .dot { width:8px; height:8px; border-radius:50%; display:inline-block; flex:none; }
-  .dot.up { background:var(--text-1); }
-  .dot.down { background:var(--red); }
+  .dot.up { background:var(--green); }
+  .dot.down { background:var(--danger); }
+  /* Running = brand red pulsing (the chassis is actively doing work, not in
+     an error state — distinct from .down which uses danger). */
   .dot.running { background:var(--red); animation: pulse 1.5s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity:1; box-shadow:0 0 0 0 var(--red-dim); } 50% { opacity:.55; box-shadow:0 0 0 3px transparent; } }
   .line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:1px 0; }
-  .line.deny { color:var(--red); }
+  .line.deny { color:var(--danger); }
   .ts { color:var(--text-3); display:inline-block; min-width:5.5em; }
   table { width:100%; border-collapse:collapse; font-size:12px; }
   td { padding:2px 10px 2px 0; vertical-align:top; }
   td.k { color:var(--text-2); white-space:nowrap; }
   .empty { color:var(--text-3); font-style:italic; font-size:11.5px; padding:4px 0; }
-  code { background:var(--bg-sub); padding:1px 5px; border-radius:3px; font-size:11px; color:var(--text-1); }
-  .pill { display:inline-block; padding:1px 6px; border-radius:10px; font-size:10px; background:var(--bg-sub); color:var(--text-2); border:1px solid var(--border-1); }
-  .pill.bad { color:var(--red-soft); border-color:var(--red-dim); }
+  /* Code wells: deep-recessed surface + 1px ring. Flat — no inner shadow. */
+  code { background:var(--bg-input); padding:1px 5px; font-size:11px; color:var(--text-1);
+    border:1px solid var(--border-1); }
+  /* Pills: hard-rect tag, no rounded curve, no shadow. */
+  .pill { display:inline-block; padding:0 6px; font-size:10px;
+    background:var(--bg-sub); color:var(--text-2); border:1px solid var(--border-1);
+    text-transform:uppercase; letter-spacing:.4px; }
+  .pill.bad { color:var(--danger-soft); border-color:var(--danger-dim); }
   .clickable { cursor:pointer; }
   .clickable:hover { background:var(--bg-hover); }
-  .error-page { padding:40px; color:var(--red); font-size:13px; }
+  .error-page { padding:40px; color:var(--danger); font-size:13px; }
   .modal { position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center; }
   .modal[hidden] { display:none; }
   .modal-backdrop { position:absolute; inset:0; background:rgba(0,0,0,.78); }
-  .modal-body { position:relative; background:var(--bg-card); border:1px solid var(--border-2); border-radius:8px; max-width:min(90vw,1100px); max-height:85vh; min-width:480px; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,.7); }
+  .modal-body { position:relative;
+    background:var(--bg-card);
+    border:1px solid var(--border-2);
+    max-width:min(90vw,1100px); max-height:85vh; min-width:480px;
+    display:flex; flex-direction:column;
+    box-shadow: 0 24px 48px rgba(0,0,0,0.55); }
   .modal-head { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-bottom:1px solid var(--border-1); gap:12px; }
   .modal-title { font-size:13px; font-weight:600; flex:1; color:var(--text-1); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .modal-close { background:none; border:none; color:var(--text-3); cursor:pointer; font-size:14px; padding:0 4px; }
@@ -792,20 +858,47 @@ INDEX_HTML = r"""<!doctype html>
   .graph .edge { fill:none; stroke-width:1.4; }
   .graph .edge.after { stroke:var(--text-3); }
   .graph .edge.on_success { stroke:var(--green); }
-  .graph .edge.on_failure { stroke:var(--red); }
+  .graph .edge.on_failure { stroke:var(--danger); }
+  /* Halo via wide stroke matching the card bg, so the label is legible where
+     it crosses the edge path without a manually sized backing rect. */
+  .graph .edge-label { fill:var(--text-2); font:10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; paint-order:stroke; stroke:var(--bg-card); stroke-width:4px; pointer-events:none; }
+  /* Live-activity layer. Each packet is a circle that rides the edge via
+     CSS offset-path. Polls replace innerHTML every 3s, so a fresh packet is
+     re-emitted each tick with animation-delay set to -age, which fast-forwards
+     it to the right point on its trajectory — animation stays continuous
+     across re-renders. The packet color matches its edge kind. */
+  .graph .packet { offset-distance:0%; opacity:0; pointer-events:none;
+    animation:packetFlow 2.5s ease-out 1 forwards;
+    animation-fill-mode:forwards; }
+  .graph .packet.after      { fill:var(--text-1); }
+  .graph .packet.on_success { fill:var(--green); }
+  .graph .packet.on_failure { fill:var(--danger); }
+  @keyframes packetFlow {
+    0%   { offset-distance:0%;   opacity:0; }
+    8%   { offset-distance:8%;   opacity:1; }
+    90%  { offset-distance:100%; opacity:1; }
+    100% { offset-distance:100%; opacity:0; }
+  }
+  /* Recency halo: an outer rect drawn before the main node rect, opacity set
+     inline from "seconds since last_run_ts" so a node that just ran flashes
+     green and fades back to invisible over a minute. Outside the main rect so
+     it doesn't fight the .running stroke animation. */
+  .graph .node .halo { fill:none; stroke:var(--green); stroke-width:2.5; pointer-events:none; }
   .graph-legend { display:flex; gap:14px; margin-top:8px; font-size:10.5px; color:var(--text-3); flex-wrap:wrap; }
   .graph-legend .swatch { display:inline-block; width:14px; height:2px; vertical-align:middle; margin-right:5px; }
   .graph-legend .swatch.dashed { border-top:1.5px dashed var(--text-3); height:0; }
   .agenda { display:flex; flex-direction:column; gap:1px; max-width:640px; }
-  .agenda-band { color:var(--text-3); font-size:10px; text-transform:uppercase; letter-spacing:.6px; padding:8px 0 3px; margin-top:6px; border-top:1px solid var(--border-1); }
-  .agenda-band:first-child { border-top:none; margin-top:0; padding-top:2px; }
-  .agenda-row { display:flex; gap:14px; padding:2px 0; align-items:baseline; font-size:12px; line-height:1.35; }
-  .agenda-when { flex:0 0 96px; color:var(--text-2); font-variant-numeric:tabular-nums; }
+  .agenda-band { color:var(--text-3); font-size:10px; text-transform:uppercase; letter-spacing:1px; padding:7px 0 2px; margin-top:5px; border-top:1px solid var(--border-1); }
+  .agenda-band:first-child { border-top:none; margin-top:0; padding-top:1px; }
+  .agenda-row { display:flex; gap:12px; padding:1px 4px; align-items:baseline; font-size:12px; line-height:1.35; border-radius:2px; }
+  .agenda-row.alt { background:rgba(255,255,255,0.025); }
+  .agenda-when { flex:0 0 88px; color:var(--text-2); font-variant-numeric:tabular-nums; text-align:right; }
   .agenda-label { color:var(--text-1); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
-  .ev-kind { display:inline-block; min-width:34px; font-size:9.5px; color:var(--text-3); text-transform:uppercase; letter-spacing:.5px; margin-right:4px; }
-  .badges { position:fixed; bottom:10px; right:12px; display:flex; gap:6px; z-index:40; pointer-events:none; }
-  .badge { padding:2px 8px; border-radius:10px; font-size:10px; font-weight:600; letter-spacing:.6px; text-transform:uppercase; border:1px solid; background:var(--bg-base); }
-  .badge.beta { color:var(--red); border-color:var(--red-dim); background:rgba(239,68,68,.08); }
+  .ev-kind { display:inline-block; min-width:34px; font-size:9.5px; color:var(--text-3); text-transform:uppercase; letter-spacing:.6px; margin-right:4px; }
+  .badges { position:fixed; bottom:8px; right:10px; display:flex; gap:6px; z-index:40; pointer-events:none; }
+  .badge { padding:1px 7px; font-size:10px; font-weight:700; letter-spacing:1px; text-transform:uppercase; border:1px solid;
+    background:var(--bg-card); }
+  .badge.beta { color:var(--red); border-color:var(--red-dim); background:rgba(239,68,68,0.1); }
 </style>
 </head>
 <body>
@@ -827,37 +920,30 @@ INDEX_HTML = r"""<!doctype html>
     <div class="modal-content"></div>
   </div>
 </div>
+<!-- @dagrejs/dagre — layered DAG layout for the trigger graph. Browser bundle
+     exposes `dagre` globally; we use it for node positioning only and keep our
+     own Bezier edge rendering on top. -->
+<script src="https://cdn.jsdelivr.net/npm/@dagrejs/dagre@1/dist/dagre.min.js"></script>
 <script>
 function escape(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function parseNum(s){if(s==null)return 0;const m=String(s).match(/-?[\d.]+/);return m?parseFloat(m[0]):0;}
-// Retro-LCD bar gauge: N small vertical segments. Lit segments scale from
-// dim grey (left) to white (right), then tint toward red as the gauge nears
-// its max — so the gauge communicates "how full" via brightness and only
-// uses red as an "approaching limit" cue. Snapping fill to segment boundaries
-// keeps the look crisp.
+// Retro-LCD bar gauge: N small vertical segments. Lit segments interpolate
+// linearly from green (left) to red (right) so the gauge reads as a health
+// gradient — left cells safe, right cells hot. Color is sampled at each
+// segment's center, so the gradient is quantised at cell boundaries.
 const GAUGE_W = 120, GAUGE_H = 24, GAUGE_BAR_Y = 5, GAUGE_BAR_H = 14;
 const GAUGE_SEGMENTS = 44;
 const GAUGE_SEG_GAP  = 0.5;
 const GAUGE_SEG_W    = (GAUGE_W - GAUGE_SEG_GAP * (GAUGE_SEGMENTS - 1)) / GAUGE_SEGMENTS;
-const GAUGE_DIM      = "#2a2a2a";   // --border-1 — unlit segments
-const GAUGE_LIT_LO   = [0x55, 0x55, 0x55];  // --text-4 (dim end of the lit ramp)
-const GAUGE_LIT_HI   = [0xf5, 0xf5, 0xf5];  // --text-1 (bright end)
-const GAUGE_RED      = [0xef, 0x44, 0x44];  // --red — tinted onto the bright end past the heat threshold
-const GAUGE_HEAT     = 0.80;        // past this fraction, lit segments blend toward red
+const GAUGE_DIM      = "#262626";   // --border-1 — unlit segments
+const GAUGE_LIT_LO   = [0x4a, 0xde, 0x80];  // --green (cool end)
+const GAUGE_LIT_HI   = [0xef, 0x44, 0x44];  // --red (hot end)
 function gaugeColor(t){
-  // t = position along the bar in [0,1]. Linear grey ramp; past GAUGE_HEAT,
-  // blend the leading segments toward red proportional to how far past we are.
+  // t = position along the bar in [0,1]. Linear RGB lerp from green to red.
   const f = Math.max(0, Math.min(t, 1));
-  const r0 = GAUGE_LIT_LO[0] + (GAUGE_LIT_HI[0] - GAUGE_LIT_LO[0]) * f;
-  const g0 = GAUGE_LIT_LO[1] + (GAUGE_LIT_HI[1] - GAUGE_LIT_LO[1]) * f;
-  const b0 = GAUGE_LIT_LO[2] + (GAUGE_LIT_HI[2] - GAUGE_LIT_LO[2]) * f;
-  let r = r0, g = g0, b = b0;
-  if (f > GAUGE_HEAT){
-    const heat = (f - GAUGE_HEAT) / (1 - GAUGE_HEAT);
-    r = r0 + (GAUGE_RED[0] - r0) * heat;
-    g = g0 + (GAUGE_RED[1] - g0) * heat;
-    b = b0 + (GAUGE_RED[2] - b0) * heat;
-  }
+  const r = GAUGE_LIT_LO[0] + (GAUGE_LIT_HI[0] - GAUGE_LIT_LO[0]) * f;
+  const g = GAUGE_LIT_LO[1] + (GAUGE_LIT_HI[1] - GAUGE_LIT_LO[1]) * f;
+  const b = GAUGE_LIT_LO[2] + (GAUGE_LIT_HI[2] - GAUGE_LIT_LO[2]) * f;
   const hex = ((Math.round(r)<<16) | (Math.round(g)<<8) | Math.round(b)).toString(16).padStart(6,"0");
   return `#${hex}`;
 }
@@ -877,14 +963,6 @@ function gauge(val, max){
 // Tool-calls gauge max is a heuristic ("busy" threshold); CPU/mem gauges
 // scale dynamically against the container's actual ceiling — see renderStats.
 const GAUGE_MAX_TOOLS = 50;
-
-function fmtBytes(b){
-  if(!b || b <= 0) return "—";
-  const units = ['B','KiB','MiB','GiB','TiB'];
-  let v = b, i = 0;
-  while (v >= 1024 && i < units.length-1){ v /= 1024; i++; }
-  return v >= 100 ? `${v.toFixed(0)} ${units[i]}` : `${v.toFixed(1)} ${units[i]}`;
-}
 
 function relTime(iso){
   if(!iso) return "—";
@@ -933,16 +1011,6 @@ function renderStats(c){
   // CPU ceiling. mem_pct is already 0–100 against the container's mem ceiling.
   const cores = limits.cpu_cores || 0;
   const cpuMax = cores > 0 ? cores * 100 : 100;
-  // "host" means there's no container-level limit and we've scaled the
-  // ceiling to HOST_FALLBACK_FRACTION (50%) of host capacity — say so
-  // explicitly so the gauge's meaning is unambiguous.
-  const hostNote = " (50% of host)";
-  const cpuLabel = cores > 0
-    ? `of ${cores < 10 ? cores.toFixed(1) : cores.toFixed(0)} ${cores === 1 ? "core" : "cores"}${limits.cpu_source === "host" ? hostNote : ""}`
-    : "—";
-  const memLabel = limits.mem_bytes
-    ? `of ${fmtBytes(limits.mem_bytes)}${limits.mem_source === "host" ? hostNote : ""}`
-    : "—";
   const hourAgo = Date.now() - 3600*1000;
   const audit = c.audit || [];
   const toolsHour = audit.filter(e => { const t = Date.parse(e.ts); return t && t >= hourAgo; }).length;
@@ -951,24 +1019,28 @@ function renderStats(c){
     if (!(t && t >= hourAgo)) return false;
     return e.status === "denied" || (e.exit && e.exit !== 0);
   }).length;
+  const denyClass = denyHour > 0 ? "warn" : "";
   return `
     <div class="stats">
       <div class="stat">
         <div class="label">cpu</div>
         <div class="value">${cpu.toFixed(1)}<span class="sub"> %</span></div>
-        <div class="sub" style="color:var(--text-3);font-size:10.5px">${escape(cpuLabel)}</div>
         ${gauge(cpu, cpuMax)}
       </div>
       <div class="stat">
         <div class="label">memory</div>
         <div class="value">${mem.toFixed(1)}<span class="sub"> %</span></div>
-        <div class="sub" style="color:var(--text-3);font-size:10.5px">${escape(memLabel)}</div>
         ${gauge(mem, 100)}
       </div>
       <div class="stat">
         <div class="label">tool calls (1h)</div>
-        <div class="value">${toolsHour}${denyHour ? ` <span class="sub">· ${denyHour} bad</span>` : ""}</div>
+        <div class="value">${toolsHour}</div>
         ${gauge(toolsHour, GAUGE_MAX_TOOLS)}
+      </div>
+      <div class="stat">
+        <div class="label">denies (1h)</div>
+        <div class="value ${denyClass}">${denyHour}</div>
+        ${gauge(denyHour, GAUGE_MAX_TOOLS)}
       </div>
     </div>`;
 }
@@ -989,122 +1061,73 @@ function renderAgents(chassis, agents){
 // nodes are pinned at depth 0 so a `cron + on_failure` task doesn't drift
 // right across cycle iterations. Pure cycles (no cron anchor) settle at
 // adjacent columns thanks to the small depth cap.
+// Node geometry — shared with the renderer. Sized to fit the longest
+// "natural" sub-line ("↳ on_success reviewer/critique") at the .sub font.
+const NODE_W = 200, NODE_H = 44;
+// Padding around the dagre-computed graph rect so the right-side back-edge
+// arcs and the top/bottom fan-out curves don't get clipped by the viewBox.
+const PAD_L = 4, PAD_T = 50, PAD_R = 170, PAD_B = 50;
+
 function layoutTasks(tasks){
   const byKey = new Map();
   tasks.forEach(t => byKey.set(`${t.agent}/${t.task}`, {...t, key:`${t.agent}/${t.task}`}));
 
-  // children[src] = [dst, ...] for forward + backward lookups during
-  // barycentric reordering. Each task has at most one trigger (one incoming
-  // edge), so the inverse map only needs to track destinations.
-  const children = new Map();
-  for (const t of byKey.values()) children.set(t.key, []);
+  // Layered LR layout via dagre. acyclicer:'greedy' reverses a minimal feedback
+  // edge set to break cycles, lays out as a DAG, then leaves the reversed
+  // edges in place — coordinate-wise our edge renderer detects them as
+  // backward by dst.x <= src.x and draws them as right-side loops.
+  const g = new dagre.graphlib.Graph();
+  g.setGraph({
+    rankdir: "LR",
+    nodesep: 24,    // vertical gap between nodes in the same rank
+    ranksep: 110,   // horizontal gap between ranks
+    marginx: PAD_L,
+    marginy: PAD_T,
+    acyclicer: "greedy",
+    ranker: "network-simplex",
+  });
+  g.setDefaultEdgeLabel(() => ({}));
+
+  for (const t of byKey.values()){
+    g.setNode(t.key, { width: NODE_W, height: NODE_H });
+  }
   for (const t of byKey.values()){
     if (!t.trigger) continue;
     const sk = `${t.trigger.agent}/${t.trigger.task}`;
-    if (byKey.has(sk)) children.get(sk).push(t.key);
+    if (!byKey.has(sk)) continue;
+    if (sk === t.key) continue;  // self-loops blow up dagre's ranker
+    g.setEdge(sk, t.key, { kind: t.trigger.kind, when: t.trigger.when });
   }
 
-  // Depth: cron-driven nodes anchor at 0 and never bump (so a cycle's
-  // back-edge doesn't push its anchor rightward). DEPTH_CAP keeps pure-cycle
-  // pairs from drifting — at cap=4 a 2-node cycle lands at columns (1, 2)
-  // with one back-edge, which renders as a clean adjacent-loop.
-  const DEPTH_CAP = 4;
-  const anchor = new Set();
-  for (const t of byKey.values()) if (t.cron) anchor.add(t.key);
-  const depth = new Map();
-  for (const t of byKey.values()) depth.set(t.key, 0);
-  for (let iter = 0; iter < DEPTH_CAP * 2; iter++){
-    let changed = false;
-    for (const t of byKey.values()){
-      if (anchor.has(t.key)) continue;
-      if (!t.trigger) continue;
-      const sk = `${t.trigger.agent}/${t.trigger.task}`;
-      if (!byKey.has(sk)) continue;
-      const want = depth.get(sk) + 1;
-      if (want > depth.get(t.key) && want < DEPTH_CAP){
-        depth.set(t.key, want);
-        changed = true;
-      }
-    }
-    if (!changed) break;
-  }
+  dagre.layout(g);
 
-  // Bucket into columns, alphabetical within for stability before reorder.
-  const cols = new Map();
-  for (const t of byKey.values()){
-    const d = depth.get(t.key);
-    if (!cols.has(d)) cols.set(d, []);
-    cols.get(d).push(t);
-  }
-  for (const arr of cols.values()) arr.sort((a, b) => a.key.localeCompare(b.key));
-  const sortedDepths = [...cols.keys()].sort((a, b) => a - b);
-
-  // Barycentric crossing minimization. Sweep columns L→R then R→L for a few
-  // iterations; each pass reorders nodes by mean index of their neighbors in
-  // the reference column. Nodes with no neighbors in the reference column
-  // sink to the bottom (large sentinel score) so they don't fight live edges.
-  const sortByBary = (col, refCol) => {
-    const refIdx = new Map();
-    cols.get(refCol).forEach((t, i) => refIdx.set(t.key, i));
-    const upstream = refCol < col;  // reference is on src side
-    const score = (t) => {
-      const links = [];
-      if (upstream){
-        if (t.trigger){
-          const sk = `${t.trigger.agent}/${t.trigger.task}`;
-          if (refIdx.has(sk)) links.push(refIdx.get(sk));
-        }
-      } else {
-        for (const ck of children.get(t.key)){
-          if (refIdx.has(ck)) links.push(refIdx.get(ck));
-        }
-      }
-      if (!links.length) return 1e9;
-      return links.reduce((a, b) => a + b, 0) / links.length;
-    };
-    // Stable sort: tiebreak on existing index so unrelated nodes stay put.
-    const orig = cols.get(col).slice();
-    const origIdx = new Map(orig.map((t, i) => [t.key, i]));
-    cols.get(col).sort((a, b) => {
-      const sa = score(a), sb = score(b);
-      if (sa !== sb) return sa - sb;
-      return origIdx.get(a.key) - origIdx.get(b.key);
-    });
-  };
-  for (let pass = 0; pass < 3; pass++){
-    for (let i = 1; i < sortedDepths.length; i++) sortByBary(sortedDepths[i], sortedDepths[i - 1]);
-    for (let i = sortedDepths.length - 2; i >= 0; i--) sortByBary(sortedDepths[i], sortedDepths[i + 1]);
-  }
-
-  const NODE_W = 200, NODE_H = 44, COL_GAP = 110, ROW_GAP = 28;
-  // Pad the viewBox so back-edge arcs that overshoot past the rightmost node
-  // and bow above/below the first/last rows don't get clipped. Shifting node
-  // coordinates by (PAD_L, PAD_T) keeps the existing pan/zoom math simple —
-  // it still treats the viewBox as a 0-rooted rect.
-  const PAD_L = 4, PAD_T = 50, PAD_R = 170, PAD_B = 50;
+  // dagre reports node center as (x, y); our renderer wants top-left. Translate
+  // here so the rest of the pipeline (rect at 0,0 inside the <g transform>) is
+  // unchanged.
   const positioned = new Map();
-  sortedDepths.forEach((d, ci) => {
-    cols.get(d).forEach((t, ri) => {
-      positioned.set(t.key, {
-        ...t,
-        x: PAD_L + ci * (NODE_W + COL_GAP),
-        y: PAD_T + ri * (NODE_H + ROW_GAP),
-      });
-    });
-  });
-  const maxRows = Math.max(0, ...[...cols.values()].map(a => a.length));
-  const innerW = sortedDepths.length ? sortedDepths.length * (NODE_W + COL_GAP) - COL_GAP : 0;
-  const innerH = maxRows * (NODE_H + ROW_GAP) - ROW_GAP;
+  for (const t of byKey.values()){
+    const n = g.node(t.key);
+    positioned.set(t.key, { ...t, x: n.x - NODE_W / 2, y: n.y - NODE_H / 2 });
+  }
+  // Pull each edge's routing polyline out of dagre — its first/last points sit
+  // on the node boundary and intermediate points route around obstacles, so we
+  // can draw the path directly without our own collision logic.
+  const edges = [];
+  for (const e of g.edges()){
+    const ed = g.edge(e);
+    edges.push({ src: e.v, dst: e.w, kind: ed.kind, when: ed.when, points: ed.points });
+  }
+  const gg = g.graph();
   return {
-    nodes: positioned, NODE_W, NODE_H,
-    width:  PAD_L + innerW + PAD_R,
-    height: PAD_T + Math.max(innerH, 0) + PAD_B,
+    nodes: positioned, edges, NODE_W, NODE_H,
+    width:  gg.width  + PAD_R,
+    height: gg.height + PAD_B,
   };
 }
 
 // Arrow-marker fill colors are pulled from the same palette as the .edge
 // stroke rules so the marker and line stay in sync per kind.
-const EDGE_COLORS = { after: "#808080", on_success: "#4ade80", on_failure: "#ef4444" };
+const EDGE_COLORS = { after: "#808080", on_success: "#4ade80", on_failure: "#f59e0b" };
 
 // Char budgets chosen so the longest "natural" labels (e.g. "⏱ */5 * * * * ·
 // next 12m ago", "↳ on_success reviewer/critique") fit inside the node at the
@@ -1114,81 +1137,78 @@ const TITLE_MAX_CHARS = 26;
 const SUB_MAX_CHARS   = 30;
 function truncate(s, n){ return s.length > n ? s.slice(0, n - 1) + "…" : s; }
 
-function renderTriggers(chassis, tasks){
+// Recency-glow window. Picks the timeframe over which a node still shows its
+// "just ran" halo; opacity decays linearly across this window.
+const HALO_WINDOW_S = 60;
+// Packet animation duration. Must match the keyframes' total length in CSS,
+// since we use it to decide whether a fire is too old to bother rendering.
+const PACKET_DUR_S = 2.5;
+
+function renderTriggers(chassis, tasks, fires){
   if (!tasks || !tasks.length) return '<div class="empty">no tasks found</div>';
   const L = layoutTasks(tasks);
   const NW = L.NODE_W, NH = L.NODE_H;
+  // Single clock reading for the whole render — keeps every age computation
+  // (packet, halo) on the same reference instant for this tick.
+  const nowMs = Date.now();
 
-  // Group outgoing edges by source. When a node has multiple outgoing edges,
-  // we distribute their attachment points along its right edge so the edges
-  // visually fan out instead of stacking on a single midpoint.
-  const outBySrc = new Map();
-  for (const dst of L.nodes.values()){
-    if (!dst.trigger) continue;
-    const src = L.nodes.get(`${dst.trigger.agent}/${dst.trigger.task}`);
-    if (!src) continue;
-    if (!outBySrc.has(src.key)) outBySrc.set(src.key, []);
-    outBySrc.get(src.key).push(dst);
-  }
-
-  // Distribute attachment Ys evenly across the middle 60% of the node so
-  // edges don't crowd the corners.
-  const attach = (src, idx, n) => {
-    if (n <= 1) return src.y + NH/2;
-    const range = NH * 0.6;
-    const start = src.y + (NH - range)/2;
-    return start + (range * idx) / (n - 1);
+  // Build a smooth SVG path through dagre's routing polyline. dagre's points
+  // sit on the node boundary at the endpoints and at chosen waypoints in
+  // between (chosen to route around other nodes); we connect them with
+  // quadratic Beziers through midpoints so each segment is C1-continuous at
+  // the joints, then land on the final point with an L so the arrow marker
+  // tracks the actual approach angle into the destination.
+  const pathThrough = (pts) => {
+    if (pts.length < 2) return "";
+    if (pts.length === 2) return `M${pts[0].x},${pts[0].y} L${pts[1].x},${pts[1].y}`;
+    let d = `M${pts[0].x},${pts[0].y}`;
+    for (let i = 1; i < pts.length - 1; i++){
+      const mx = (pts[i].x + pts[i+1].x) / 2;
+      const my = (pts[i].y + pts[i+1].y) / 2;
+      d += ` Q${pts[i].x},${pts[i].y} ${mx},${my}`;
+    }
+    const last = pts[pts.length - 1];
+    d += ` L${last.x},${last.y}`;
+    return d;
   };
 
   let edgesSvg = "";
-  for (const [srcKey, dsts] of outBySrc){
-    const src = L.nodes.get(srcKey);
-    // Sort forward edges first (by dst.y), then backward edges (by dst.y).
-    // Forward and backward edges leave different sides of src effectively,
-    // so we count them separately for attachment spacing.
-    dsts.sort((a, b) => {
-      const af = a.x > src.x, bf = b.x > src.x;
-      if (af !== bf) return af ? -1 : 1;
-      return a.y - b.y;
-    });
-    const fwd  = dsts.filter(d => d.x  >  src.x);
-    const back = dsts.filter(d => d.x <=  src.x);
-    let fi = 0, bi = 0;
-    for (const dst of dsts){
-      const isBackward = dst.x <= src.x;
-      const kind = ["after","on_success","on_failure"].includes(dst.trigger.kind) ? dst.trigger.kind : "after";
-      let d;
-      if (!isBackward){
-        // Forward edge: src right → dst left, smooth cubic Bezier. Handle
-        // length scales with both dx and |dy| so steep edges still curve
-        // gracefully instead of S-bending sharply near the endpoints.
-        const x1 = src.x + NW, y1 = attach(src, fi++, fwd.length);
-        const x2 = dst.x,      y2 = dst.y + NH/2;
-        const dxe = x2 - x1, dye = Math.abs(y2 - y1);
-        const h = Math.min(Math.max(90, dxe * 0.55 + dye * 0.35), Math.max(120, dxe * 0.9));
-        d = `M${x1},${y1} C${x1+h},${y1} ${x2-h},${y2} ${x2},${y2}`;
-      } else {
-        // Backward edge (cycle): loop on the right side of both nodes.
-        // Exits src from the right, curls around to the right, re-enters dst
-        // from the right. Keeps cycles visually distinct from forward edges
-        // and avoids crossing nodes between dst and src. When dy is tiny
-        // (same row), pulling control points purely horizontally would
-        // collapse the curve onto a flat line — bow them outward instead.
-        const x1 = src.x + NW, y1 = attach(src, bi++, back.length);
-        const x2 = dst.x + NW, y2 = dst.y + NH/2;
-        const dye = Math.abs(y2 - y1);
-        // Overshoot scales with column span so a multi-column back-edge gets a
-        // bigger swing than a tight 2-cycle; minimum keeps adjacent cycles
-        // visibly looped instead of collapsing onto a straight line.
-        const dxe = Math.abs(x1 - x2);
-        const overshoot = Math.max(80, dxe * 0.35) + dye * 0.2;
-        const hx = Math.max(x1, x2) + overshoot;
-        // When y1 ≈ y2 the curve would collapse onto a flat segment; bow the
-        // control points upward so the arc is visibly distinct.
-        const bow = dye < 8 ? 42 : 0;
-        d = `M${x1},${y1} C${hx},${y1-bow} ${hx},${y2-bow} ${x2},${y2}`;
-      }
-      edgesSvg += `<path class="edge ${kind}" d="${d}" marker-end="url(#arrow-${kind})"/>`;
+  // Remember each edge's rendered path so a fire's packet can ride the exact
+  // same routing the line draws. Keyed by "src|dst" to match how fires are
+  // identified on the wire.
+  const edgePaths = new Map();
+  for (const e of L.edges){
+    const kind = ["after","on_success","on_failure"].includes(e.kind) ? e.kind : "after";
+    const d = pathThrough(e.points);
+    edgePaths.set(`${e.src}|${e.dst}`, { d, kind });
+    edgesSvg += `<path class="edge ${kind}" d="${d}" marker-end="url(#arrow-${kind})"/>`;
+    if (e.when){
+      // Anchor the label at the middle waypoint of the routing polyline; for
+      // a 2-point edge fall back to the segment midpoint.
+      const p = e.points;
+      const mid = p.length >= 3 ? p[Math.floor(p.length / 2)] : { x:(p[0].x+p[1].x)/2, y:(p[0].y+p[1].y)/2 };
+      const label = `${e.when.key} ${e.when.op} ${e.when.value}`;
+      edgesSvg += `<text class="edge-label" x="${mid.x}" y="${mid.y}" text-anchor="middle" dominant-baseline="middle">${escape(label)}</text>`;
+    }
+  }
+
+  // Animated packets for recently-fired triggers. A fire still inside the
+  // animation window emits a circle with offset-path tracing its edge; the
+  // -age animation-delay places it on the curve at the proportional point,
+  // so the packet keeps progressing smoothly across the 3-second poll cycle.
+  let packetsSvg = "";
+  if (fires){
+    for (const f of fires){
+      const ts = Date.parse(f.ts);
+      if (!ts) continue;
+      const ageS = (nowMs - ts) / 1000;
+      if (ageS < -1 || ageS > PACKET_DUR_S) continue;
+      const ep = edgePaths.get(`${f.src_agent}/${f.src_task}|${f.dst_agent}/${f.dst_task}`);
+      if (!ep) continue;
+      // Clamp negative age (client clock ahead of server) to 0 so the packet
+      // starts at the beginning instead of sliding past its endpoint.
+      const delay = Math.max(0, ageS).toFixed(2);
+      packetsSvg += `<circle class="packet ${ep.kind}" r="5" style="offset-path:path('${ep.d}'); animation-delay:-${delay}s;"/>`;
     }
   }
   let nodesSvg = "";
@@ -1207,9 +1227,9 @@ function renderTriggers(chassis, tasks){
       const nx = t.next ? ` · next ${relTime(t.next)}` : "";
       subRaw = `⏱ ${t.cron}${nx}`;
     } else if (t.trigger){
-      const w = t.trigger.when;
-      const wTail = w ? ` [${w.key}${w.op}${w.value}]` : "";
-      subRaw = `↳ ${t.trigger.kind} ${t.trigger.agent}/${t.trigger.task}${wTail}`;
+      // The when clause is rendered on the incoming edge instead — keeps the
+      // node label short and the routing condition visible at the edge.
+      subRaw = `↳ ${t.trigger.kind} ${t.trigger.agent}/${t.trigger.task}`;
     } else {
       subRaw = "manual";
     }
@@ -1218,9 +1238,21 @@ function renderTriggers(chassis, tasks){
     // Full text in the <title> so hover always reveals what was truncated;
     // also useful when the user wants to read a long cron expression.
     const tooltip = `${titleRaw}\n${subRaw}`;
+    // Recency halo: linear opacity decay across HALO_WINDOW_S. last_run_ts is
+    // the mtime of the latest run-log jsonl (server clock); we compare to
+    // nowMs/1000 so we don't depend on a separate server-clock field.
+    let haloSvg = "";
+    if (t.last_run_ts){
+      const ageS = (nowMs / 1000) - t.last_run_ts;
+      if (ageS < HALO_WINDOW_S){
+        const opacity = Math.max(0, 1 - ageS / HALO_WINDOW_S).toFixed(2);
+        haloSvg = `<rect class="halo" x="-4" y="-4" width="${NW + 8}" height="${NH + 8}" rx="8" style="opacity:${opacity}"/>`;
+      }
+    }
     nodesSvg += `
       <g class="${classes.join(' ')}" data-chassis="${escape(chassis)}" data-agent="${escape(t.agent)}" data-task="${escape(t.task)}" transform="translate(${t.x},${t.y})">
         <title>${escape(tooltip)}</title>
+        ${haloSvg}
         <rect width="${NW}" height="${NH}" rx="6"/>
         <text class="title" x="10" y="18">${escape(titleDisp)}</text>
         <text class="sub"   x="10" y="33">${escape(subDisp)}</text>
@@ -1235,13 +1267,14 @@ function renderTriggers(chassis, tasks){
       <svg class="graph" viewBox="0 0 ${L.width} ${L.height}" data-nat-w="${L.width}" data-nat-h="${L.height}" preserveAspectRatio="xMidYMid meet">
         <defs>${markers}</defs>
         ${edgesSvg}
+        ${packetsSvg}
         ${nodesSvg}
       </svg>
     </div>
     <div class="graph-legend">
       <span><span class="swatch" style="background:${EDGE_COLORS.on_success}"></span>on_success</span>
       <span><span class="swatch" style="background:${EDGE_COLORS.after}"></span>after</span>
-      <span><span class="swatch" style="background:${EDGE_COLORS.on_failure}"></span>on_failure / running</span>
+      <span><span class="swatch" style="background:${EDGE_COLORS.on_failure}"></span>on_failure</span>
       <span><span class="swatch" style="background:var(--text-1)"></span>cron-rooted</span>
       <span><span class="swatch dashed"></span>manual (no cron, no trigger)</span>
     </div>`;
@@ -1283,6 +1316,7 @@ function renderSchedule(jobs){
   ];
   let html = '<div class="agenda">';
   let bandIdx = 0;
+  let rowIdx = 0;
   html += `<div class="agenda-band">${BANDS[0].label}</div>`;
   bandIdx = 1;
   for (const ev of events){
@@ -1291,8 +1325,9 @@ function renderSchedule(jobs){
       html += `<div class="agenda-band">${BANDS[bandIdx].label}</div>`;
       bandIdx++;
     }
+    const alt = rowIdx++ % 2 ? ' alt' : '';
     html += `
-      <div class="agenda-row">
+      <div class="agenda-row${alt}">
         <span class="agenda-when">${escape(fmtUntil(ev.iso))}</span>
         <span class="agenda-label" title="${escape(ev.schedule)}">${escape(ev.label)}</span>
       </div>`;
@@ -1351,7 +1386,7 @@ function renderPage(c){
     ${renderStats(c)}
     <div class="main">
       <div class="main-left">
-        <div class="block hero-graph"><h3>triggers</h3><div class="block-body">${renderTriggers(c.name, c.tasks)}</div></div>
+        <div class="block hero-graph"><h3>triggers</h3><div class="block-body">${renderTriggers(c.name, c.tasks, c.fires)}</div></div>
         <div class="blocks">
           <div class="block"><h3>agents</h3><div class="block-body">${renderAgents(c.name, c.agents)}</div></div>
           <div class="block"><h3>events</h3><div class="block-body">${renderEvents(c.audit, c.fires)}</div></div>
@@ -1554,7 +1589,14 @@ function attachGraphPanZoom(){
     // the same cursor px.
     const vbMx = graphVB.x + (mx / rect.width)  * graphVB.w;
     const vbMy = graphVB.y + (my / rect.height) * graphVB.h;
-    const factor = e.deltaY < 0 ? 1/1.15 : 1.15;
+    // Magnitude-aware zoom: a small trackpad nudge (deltaY≈4) gives a 0.6%
+    // step; a full mouse-wheel detent (deltaY≈100) gives ~16%. Previous
+    // implementation used only the sign and treated both the same, which
+    // made trackpads feel runaway-twitchy. Sensitivity tuned to match the
+    // old 1.15× per detent at deltaY=100. Clamped so a single fast scroll
+    // event (some browsers emit deltaY>500) can't slam past the zoom range.
+    const k = 0.0014;
+    const factor = Math.exp(Math.max(-0.5, Math.min(0.5, e.deltaY * k)));
     const newW = graphVB.w * factor;
     // Clamp: 0.15× natural (zoomed in tight) to 6× natural (zoomed way out).
     if(newW < natW * 0.15 || newW > natW * 6) return;
