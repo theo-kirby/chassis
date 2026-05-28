@@ -125,8 +125,25 @@ def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, **kwargs)
 
 
+def host_default_limits() -> dict[str, str]:
+    """Default the chassis container to 50% of host CPU + memory. Compose
+    references these via ${CHASSIS_CPUS} / ${CHASSIS_MEM}; operators can
+    pin specific values by exporting either before `./chassis up`."""
+    out: dict[str, str] = {}
+    if not os.environ.get("CHASSIS_CPUS"):
+        cores = (os.cpu_count() or 2) * 0.5
+        out["CHASSIS_CPUS"] = f"{cores:g}"
+    if not os.environ.get("CHASSIS_MEM"):
+        try:
+            mem = int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") * 0.5)
+        except (AttributeError, ValueError, OSError):
+            mem = 2 * 1024 * 1024 * 1024  # 2 GiB fallback
+        out["CHASSIS_MEM"] = str(mem)
+    return out
+
+
 def compose(args: list[str], **kwargs) -> subprocess.CompletedProcess:
-    env = {**os.environ, "CHASSIS_NAME": NAME}
+    env = {**os.environ, "CHASSIS_NAME": NAME, **host_default_limits()}
     return run(
         ["docker", "compose", "--project-name", PROJECT, *args],
         cwd=REPO, env=env, **kwargs,

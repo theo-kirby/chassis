@@ -28,29 +28,64 @@ fire_triggers() {
     else
         accept=" after  on_failure "
     fi
+    # Verdict snapshot string — built once per fire_triggers call and reused in
+    # every per-trigger log line. The VERDICT assoc array is a global written
+    # by the caller from $CHASSIS_VERDICT_FILE.
+    local verdict_str="" vk
+    for vk in "${!VERDICT[@]}"; do verdict_str+="$vk=${VERDICT[$vk]},"; done
+    verdict_str="${verdict_str%,}"
+
     local trigger_file
     for trigger_file in /home/agent/*/*/trigger; do
         [[ -f "$trigger_file" ]] || continue
-        local line kind ref
+        local line kind ref when_kw lhs op rhs
         line="$(grep -v '^[[:space:]]*#' "$trigger_file" | grep -v '^[[:space:]]*$' | head -1 || true)"
         [[ -z "$line" ]] && continue
-        read -r kind ref _ <<<"$line"
+        # Reset per-line so a previous iteration's `when` doesn't leak in.
+        kind="" ref="" when_kw="" lhs="" op="" rhs=""
+        read -r kind ref when_kw lhs op rhs _ <<<"$line"
         [[ -z "${kind:-}" || -z "${ref:-}" || "$ref" != */* ]] && continue
         [[ "$accept" == *" $kind "* ]] || continue
 
         local ref_agent="${ref%%/*}" ref_task="${ref##*/}"
         [[ "$ref_agent" == "$src_agent" && "$ref_task" == "$src_task" ]] || continue
 
+        # Optional `when <key> <op> <value>` clause. A missing verdict key
+        # means the trigger does not fire — every routing path must either
+        # produce a verdict or fall through to a plain on_failure safety net.
+        if [[ -n "${when_kw:-}" ]]; then
+            [[ "$when_kw" == "when" ]] || continue
+            [[ -n "${lhs:-}" && -n "${op:-}" && -n "${rhs:-}" ]] || continue
+            local val="${VERDICT[$lhs]:-}"
+            [[ -z "$val" ]] && continue
+            case "$op" in
+                "==") [[ "$val" == "$rhs" ]] || continue ;;
+                "!=") [[ "$val" != "$rhs" ]] || continue ;;
+                "<"|">"|"<="|">=")
+                    [[ "$val" =~ ^-?[0-9]+$ && "$rhs" =~ ^-?[0-9]+$ ]] || continue
+                    case "$op" in
+                        "<")  (( val <  rhs )) || continue ;;
+                        ">")  (( val >  rhs )) || continue ;;
+                        "<=") (( val <= rhs )) || continue ;;
+                        ">=") (( val >= rhs )) || continue ;;
+                    esac ;;
+                *) continue ;;
+            esac
+        fi
+
         local dst_dir dst_agent dst_task
         dst_dir="$(dirname "$trigger_file")"
         dst_task="$(basename "$dst_dir")"
         dst_agent="$(basename "$(dirname "$dst_dir")")"
 
+        local when_str=""
+        [[ -n "${when_kw:-}" ]] && when_str=" when ${lhs} ${op} ${rhs}"
+
         mkdir -p "$LOG_DIR"
-        printf '[%s] trigger %s/%s (%s rc=%d) -> %s/%s\n' \
+        printf '[%s] trigger %s/%s (%s rc=%d verdict={%s}) -> %s/%s%s\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            "$src_agent" "$src_task" "$kind" "$rc" \
-            "$dst_agent" "$dst_task" >>"$TRIGGER_LOG"
+            "$src_agent" "$src_task" "$kind" "$rc" "$verdict_str" \
+            "$dst_agent" "$dst_task" "$when_str" >>"$TRIGGER_LOG"
 
         setsid /usr/local/bin/run-agent "$dst_agent" "$dst_task" \
             >>"$TRIGGER_LOG" 2>&1 </dev/null &
@@ -83,6 +118,14 @@ if [[ -n "$task" ]]; then
     # Session is kept so the per-agent run log can record session_file and
     # the operator can replay the model's reasoning if a task misbehaves.
     extra+=(--print)
+
+    # Per-run verdict file. The `verdict` tool appends k=v lines here; after
+    # pi exits we slurp them into the VERDICT assoc array so fire_triggers
+    # can evaluate `when` clauses against the task's published verdicts.
+    # $$-$(date +%s%N) keeps the path unique across overlapping runs.
+    CHASSIS_RUN_ID="${agent}-${task}-$$-$(date +%s%N)"
+    export CHASSIS_VERDICT_FILE="/tmp/chassis-verdict-${CHASSIS_RUN_ID}"
+    : > "$CHASSIS_VERDICT_FILE"
 fi
 
 # Resolve which model pi should use. agent.json:model is the per-agent
@@ -126,9 +169,25 @@ fi
 # One-shot task: run, capture rc (without tripping set -e), fan out triggers.
 rc=0
 if [[ $(id -u) -eq 0 ]]; then
-    runuser -u agent -- env CHASSIS_AGENT="$agent" CHASSIS_TASK="$task" "${cmd[@]}" || rc=$?
+    runuser -u agent -- env \
+        CHASSIS_AGENT="$agent" \
+        CHASSIS_TASK="$task" \
+        CHASSIS_VERDICT_FILE="$CHASSIS_VERDICT_FILE" \
+        "${cmd[@]}" || rc=$?
 else
     "${cmd[@]}" || rc=$?
 fi
+
+# Slurp verdicts written by the task. Last-write-wins per key, so a task that
+# revises a verdict mid-run gets its final value applied to routing. The file
+# is owned by the task ($CHASSIS_VERDICT_FILE is exported and the verdict tool
+# writes to that path), so we rm it after reading.
+declare -A VERDICT
+while IFS='=' read -r k v; do
+    [[ -z "$k" || "$k" == \#* ]] && continue
+    VERDICT["$k"]="$v"
+done < "$CHASSIS_VERDICT_FILE" 2>/dev/null || true
+rm -f "$CHASSIS_VERDICT_FILE"
+
 fire_triggers "$agent" "$task" "$rc" || true
 exit "$rc"

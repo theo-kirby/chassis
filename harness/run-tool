@@ -151,6 +151,12 @@ def main() -> int:
         "HOME": "/root",
         "LANG": os.environ.get("LANG", "C.UTF-8"),
     }
+    # Chassis context vars — the `verdict` tool needs CHASSIS_VERDICT_FILE to
+    # know where to publish; agent/task identifiers are passed for any future
+    # tool that wants to attribute its action. None of these carry secrets.
+    for k in ("CHASSIS_VERDICT_FILE", "CHASSIS_AGENT", "CHASSIS_TASK"):
+        if k in os.environ:
+            child_env[k] = os.environ[k]
     child_env.update(secret_values)
 
     # Resolve script + runner.

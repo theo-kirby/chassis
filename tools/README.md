@@ -44,6 +44,6 @@ The dispatcher captures stdout and stderr, redacts every `.env` value out of bot
 
 ## Adding a tool
 
-1. Write the script at `tools/<name>`; read JSON args from `argv[1]`. The script runs **as root** with only `PATH`/`HOME`/`LANG` plus the declared `secrets` in its env.
+1. Write the script at `tools/<name>`; read JSON args from `argv[1]`. The script runs **as root** with only `PATH`/`HOME`/`LANG`, the declared `secrets`, and the chassis-context vars (`CHASSIS_AGENT`, `CHASSIS_TASK`, `CHASSIS_VERDICT_FILE`) in its env.
 2. Append an entry to `tools/tools.json` (see schema above).
 3. `./chassis reload-cron` — re-renders `/etc/chassis/tools-public.json` so the next agent session sees the new tool.

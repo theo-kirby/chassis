@@ -78,18 +78,34 @@ A task can be launched from a `cron` line (time), from a `trigger` line (the com
 
 Grammar:
 ```
-after      <agent>/<task>    # fire when that task completes (any exit)
-on_success <agent>/<task>    # fire only on exit 0
-on_failure <agent>/<task>    # fire only on non-zero exit
+after      <agent>/<task> [when <key> <op> <value>]    # fire when that task completes (any exit)
+on_success <agent>/<task> [when <key> <op> <value>]    # fire only on exit 0
+on_failure <agent>/<task> [when <key> <op> <value>]    # fire only on non-zero exit
 ```
 
-Example — a reviewer that re-runs whenever the writer succeeds:
+The optional `when` clause gates the trigger on a verdict published by the upstream task (see [Verdicts](#verdicts) below). `<op>` is one of `==`, `!=`, `<`, `>`, `<=`, `>=` — equality compares as strings, ordering requires both sides to be integers. **A `when` clause whose verdict key is missing does not fire** — every routing path must either publish a matching verdict or fall through to a plain `on_failure` safety net.
+
+### Verdicts
+
+A task publishes named verdicts via the `verdict` tool — `verdict {"score": 7}` — and downstream `when` clauses route on them. Verdicts are scalar k/v pairs; last write per key wins; they're scoped to one task run (a fresh file per invocation, removed by `run-agent` after fan-out).
+
+Example — score-routed editing pipeline:
 ```
 /home/agent/writer/draft/INSTRUCTIONS.md
-/home/agent/writer/draft/cron               0 9 * * *
-/home/agent/reviewer/critique/INSTRUCTIONS.md
-/home/agent/reviewer/critique/trigger       on_success writer/draft
+/home/agent/writer/draft/cron                  0 9 * * *
+/home/agent/writer/draft/trigger               after reviewer/eval when score <= 5
+
+/home/agent/reviewer/eval/INSTRUCTIONS.md       # …calls `verdict {"score": <0..10>}`
+/home/agent/reviewer/eval/trigger              on_success writer/draft
+
+/home/agent/editor/polish/INSTRUCTIONS.md
+/home/agent/editor/polish/trigger              after reviewer/eval when score > 5
+
+/home/agent/writer/fix/INSTRUCTIONS.md
+/home/agent/writer/fix/trigger                 on_failure reviewer/eval
 ```
+
+A high score routes the draft to `editor/polish`; a low score loops back to `writer/draft`; if the reviewer itself crashes, `writer/fix` is the safety net.
 
 Fan-out happens at the tail of `run-agent`: when a task finishes, every sibling `trigger` file whose reference matches the just-completed `(agent, task)` is fired in the background via `setsid run-agent`. Interactive sessions (no task argument) do not fan out.
 
@@ -103,6 +119,7 @@ Tools are scripts in `tools/` registered in [`tools/tools.json`](tools/tools.jso
 |---|---|---|
 | `web-search` | DuckDuckGo HTML scrape (no key); returns title/url/content. | — |
 | `web-fetch` | Fetch http(s) URL, optional tag-strip, char-capped. | — |
+| `verdict` | Publish k/v scalars consumed by downstream `when` clauses. See [Verdicts](#verdicts). | — |
 
 Add a tool: drop a script in `tools/`, append an entry to `tools.json`, run `chassis reload-cron`. See [`tools/README.md`](tools/README.md) for the full contract.
 

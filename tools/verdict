@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""verdict — publish k/v verdicts to $CHASSIS_VERDICT_FILE for trigger routing.
+
+args: {key: scalar, ...}. Coerces values to bare strings (booleans → "true"/
+"false"; numbers → decimal). Triggers downstream evaluate the file's last
+value per key, so a task can revise a verdict mid-run by calling again.
+"""
+
+import json
+import os
+import sys
+
+
+def coerce(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
+def main() -> int:
+    path = os.environ.get("CHASSIS_VERDICT_FILE")
+    if not path:
+        print(
+            "verdict: $CHASSIS_VERDICT_FILE is unset — this tool only works "
+            "inside a task run launched by run-agent.",
+            file=sys.stderr,
+        )
+        return 1
+    args = json.loads(sys.argv[1])
+    if not isinstance(args, dict) or not args:
+        print("verdict: args must be a non-empty object", file=sys.stderr)
+        return 1
+    with open(path, "a") as f:
+        for k, v in args.items():
+            f.write(f"{k}={coerce(v)}\n")
+    print(json.dumps({"published": {k: coerce(v) for k, v in args.items()}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

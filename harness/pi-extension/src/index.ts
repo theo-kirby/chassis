@@ -84,10 +84,18 @@ function makeTool(meta: PublicTool) {
       _ctx: ExtensionContext,
     ) {
       const json = JSON.stringify(params ?? {});
+      // Preserve CHASSIS_* through sudo so the dispatcher can forward them to
+      // the tool's child env. Without --preserve-env, sudo strips the caller's
+      // environment and the `verdict` tool would see no $CHASSIS_VERDICT_FILE.
       const result = spawnSync(
         "sudo",
-        ["/usr/local/bin/run-tool", meta.name, json],
-        { encoding: "utf8" },
+        [
+          "--preserve-env=CHASSIS_VERDICT_FILE,CHASSIS_AGENT,CHASSIS_TASK",
+          "/usr/local/bin/run-tool",
+          meta.name,
+          json,
+        ],
+        { encoding: "utf8", env: process.env as Record<string, string> },
       );
       const stdout = result.stdout || "";
       const stderr = result.stderr || "";

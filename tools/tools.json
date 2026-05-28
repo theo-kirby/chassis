@@ -17,6 +17,18 @@
       "secrets": []
     },
     {
+      "name": "verdict",
+      "description": "Publish a named verdict (k/v pairs) that downstream triggers can route on via `when <key> <op> <value>`. Last write per key wins.",
+      "script": "verdict",
+      "runner": "python3",
+      "args_schema": {
+        "type": "object",
+        "additionalProperties": { "type": ["string", "number", "integer", "boolean"] },
+        "minProperties": 1
+      },
+      "secrets": []
+    },
+    {
       "name": "web-fetch",
       "description": "Fetch a URL (http/https only). By default the response is run through an HTML/XML tag stripper and capped at 25000 chars — keeps LLM context manageable for typical pages and feeds. Pass `raw: true` to get the unparsed body (still char-capped). Pass `max_chars` (1000-200000) to override the cap. Default timeout 15s.",
       "script": "web-fetch",

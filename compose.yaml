@@ -5,6 +5,12 @@ services:
     # git branch — branch name verbatim, with `main` → "default".
     image: ${CHASSIS_NAME:-default}-chassis
     container_name: ${CHASSIS_NAME:-default}-chassis
+    # Resource ceiling — defaults to 50% of host via the ./chassis CLI, which
+    # exports CHASSIS_CPUS / CHASSIS_MEM before invoking docker compose. The
+    # static fallbacks here (2 cores, 2 GiB) only matter if compose is invoked
+    # directly without the chassis CLI in front of it.
+    cpus: ${CHASSIS_CPUS:-2}
+    mem_limit: ${CHASSIS_MEM:-2147483648}
     environment:
       - TZ=${TZ:-UTC}
     env_file:
