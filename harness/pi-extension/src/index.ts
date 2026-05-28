@@ -2,7 +2,7 @@
  * chassis-pi-extension — wires chassis's tool surface and agent identity into
  * a Pi session. Loaded via `pi -e /usr/local/lib/chassis-ext/index.js`. Reads
  * CHASSIS_AGENT / CHASSIS_TASK (set by run-agent) plus files under
- * /home/agent/<agent>/ and /etc/chassis/tools-public.json.
+ * $AGENT_HOME/<agent>/ and /etc/chassis/tools-public.json.
  */
 
 import * as fs from "node:fs";
@@ -14,7 +14,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-const AGENT_HOME = "/home/agent";
+const AGENT_HOME = process.env.AGENT_HOME || "/home/agent";
 const TOOLS_PUBLIC = "/etc/chassis/tools-public.json";
 const LOG_DIR = "/var/log/chassis";
 

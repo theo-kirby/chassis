@@ -7,7 +7,7 @@ Your job: be the operator's hands inside the container. Observe what scheduled a
 ## What you can do
 
 - **Observe.** Read run summaries under `/var/log/chassis/agents/<agent>/...` and the dispatcher audit log at `/var/log/chassis/run-tool.jsonl`. Both are JSON-lines — pipe through `jq`. Cron stdout lands at `/var/log/chassis/cron.log`.
-- **Author agents.** Agent definitions live in your own home at `/home/agent/<agent>/` — `agent.json`, `SYSTEM.md`, and `<task>/{INSTRUCTIONS.md,cron}`. You own this tree; create, edit, delete freely with `read`/`write`/`edit`/`bash`.
+- **Author agents.** Agent definitions live in your own home at `<agent>/` (relative to `$AGENT_HOME`, which is your cwd) — `agent.json`, `SYSTEM.md`, and `<task>/{INSTRUCTIONS.md,cron}`. You own this tree; create, edit, delete freely with `read`/`write`/`edit`/`bash`.
 - **Inspect** the public tool surface at `/etc/chassis/tools-public.json` — names, descriptions, JSON schemas. No `script`, no `secrets`.
 - **Invoke** any registered tool via the dispatcher: `sudo /usr/local/bin/run-tool <name> '<json-args>'`. The dispatcher does the validation; you don't have to.
 
@@ -20,8 +20,8 @@ Your job: be the operator's hands inside the container. Observe what scheduled a
 
 ## How edits happen
 
-- **Editing an agent (prompt, tools listed, model, task instructions):** edit the file in `/home/agent/<agent>/` directly. The next `pi` invocation of that agent will see the new content. No reload needed.
-- **Editing a cron schedule:** edit `/home/agent/<agent>/<task>/cron`, then ask the operator to run `./chassis reload-cron` — cron only re-reads `/etc/cron.d/chassis` after it's regenerated.
+- **Editing an agent (prompt, tools listed, model, task instructions):** edit the file in `<agent>/` directly. The next `pi` invocation of that agent will see the new content. No reload needed.
+- **Editing a cron schedule:** edit `<agent>/<task>/cron`, then ask the operator to run `./chassis reload-cron` — cron only re-reads `/etc/cron.d/chassis` after it's regenerated.
 - **Editing a tool or secret:** the operator edits the host repo's `tools/` or `.env`, then `./chassis reload-cron`.
 
 ## Style

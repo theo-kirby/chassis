@@ -8,10 +8,12 @@
 
 set -euo pipefail
 
+AGENT_HOME="${AGENT_HOME:-/home/agent}"
+
 LOG_DIR=/var/log/chassis
 TRIGGER_LOG="$LOG_DIR/triggers.log"
 
-# After a task finishes, walk /home/agent/<a>/<t>/trigger and fire any task
+# After a task finishes, walk $AGENT_HOME/<a>/<t>/trigger and fire any task
 # whose trigger points at the just-completed (agent, task). Grammar is one
 # line, mirroring the cron file:
 #   after      <agent>/<task>   # fires on any exit
@@ -36,7 +38,7 @@ fire_triggers() {
     verdict_str="${verdict_str%,}"
 
     local trigger_file
-    for trigger_file in /home/agent/*/*/trigger; do
+    for trigger_file in "$AGENT_HOME"/*/*/trigger; do
         [[ -f "$trigger_file" ]] || continue
         local line kind ref when_kw lhs op rhs
         line="$(grep -v '^[[:space:]]*#' "$trigger_file" | grep -v '^[[:space:]]*$' | head -1 || true)"
@@ -108,7 +110,7 @@ extra=()
 prompt=""
 
 if [[ -n "$task" ]]; then
-    instructions="/home/agent/$agent/$task/INSTRUCTIONS.md"
+    instructions="$AGENT_HOME/$agent/$task/INSTRUCTIONS.md"
     if [[ ! -f "$instructions" ]]; then
         echo "run-agent: task instructions not found at $instructions" >&2
         exit 1
@@ -132,7 +134,7 @@ fi
 # override (a pattern like "llm/Qwen/Qwen3-4B" or a glob like "*Qwen3*").
 # When unset, fall back to the chassis default — composed from the
 # LLM_MODEL_ID env var (sourced from harness/llm.env).
-AGENT_JSON="/home/agent/$agent/agent.json"
+AGENT_JSON="$AGENT_HOME/$agent/agent.json"
 model=""
 if [[ -f "$AGENT_JSON" ]]; then
     model="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("model","") or "")' "$AGENT_JSON")"
@@ -156,11 +158,16 @@ EXT=/usr/local/lib/chassis-ext/index.js
 cmd=(pi "${extra[@]}" --no-builtin-tools -e "$EXT")
 [[ -n "$prompt" ]] && cmd+=("$prompt")
 
+# Run from the agent's workspace so docs/instructions can use relative paths
+# like memory/ and user.json — they resolve correctly under any AGENT_HOME
+# (including per-user subdirs on a shared mount).
+cd "$AGENT_HOME"
+
 # Interactive (no task): hand the tty to pi and exit. No trigger fan-out for
 # operator-driven sessions; only scheduled/triggered tasks chain.
 if [[ -z "$task" ]]; then
     if [[ $(id -u) -eq 0 ]]; then
-        exec runuser -u agent -- env CHASSIS_AGENT="$agent" CHASSIS_TASK="$task" "${cmd[@]}"
+        exec runuser -u agent -- env AGENT_HOME="$AGENT_HOME" CHASSIS_AGENT="$agent" CHASSIS_TASK="$task" "${cmd[@]}"
     else
         exec "${cmd[@]}"
     fi
@@ -170,6 +177,7 @@ fi
 rc=0
 if [[ $(id -u) -eq 0 ]]; then
     runuser -u agent -- env \
+        AGENT_HOME="$AGENT_HOME" \
         CHASSIS_AGENT="$agent" \
         CHASSIS_TASK="$task" \
         CHASSIS_VERDICT_FILE="$CHASSIS_VERDICT_FILE" \
