@@ -674,6 +674,15 @@ INDEX_HTML = r"""<!doctype html>
 <style>
   :root {
     color-scheme: dark;
+    /* Fluid root font-size: the whole UI is sized in rem off this value, so the
+       dashboard scales proportionally to the screen ("fits the scale of any
+       screen") instead of staying a fixed-px island. The clamp tracks both
+       width and height so it shrinks on short viewports (helping the no-scroll
+       layout) and grows on large/4K monitors. Tuned so 1rem ≈ 16px at a
+       1440×900 laptop — the size the px design was originally hand-tuned at —
+       then scales out from there. SVG graph internals are NOT in rem; they
+       scale via the graph's own viewBox. */
+    font-size: clamp(13px, 0.45vw + 0.45vh + 5.5px, 21px);
     /* Neutral-grey charcoal palette (R = G = B at every step) — no blue cast.
        Step sizes preserve clear separation between background, card surface,
        and the hero block. */
@@ -704,62 +713,64 @@ INDEX_HTML = r"""<!doctype html>
   }
   html, body { height:100%; }
   html { overflow:hidden; }
-  body { font: 12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  body { font: 0.781rem/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     background:var(--bg-base); color:var(--text-2);
     font-variant-numeric: tabular-nums;
     margin:0; padding:0; display:flex; flex-direction:column; overflow:hidden; }
   /* Bloomberg-leaning chrome: hard rules, no rounded corners, no drop shadow.
      The topbar is the deepest tone in the palette and is separated from the
      page by a single 1px border-2 rule. */
-  .topbar { display:flex; align-items:center; gap:16px; padding:6px 14px;
+  .topbar { display:flex; align-items:center; gap:1rem; padding:0.375rem 0.875rem;
     background:var(--bg-topbar);
     border-bottom:1px solid var(--border-2);
     color:var(--text-1); position:relative; z-index:1; }
   /* Brand: red leftbar motif + car emoji + wordmark. The leftbar is a thin
      2px rule that visually anchors the wordmark like a terminal title. */
-  .topbar .brand { display:flex; align-items:center; gap:8px; font-size:14px; font-weight:600; letter-spacing:.5px; }
-  .topbar .brand::before { content:""; display:block; width:2px; height:16px; background:var(--red); }
-  .topbar .brand .car { font-size:16px; filter:saturate(1.4); }
+  .topbar .brand { display:flex; align-items:center; gap:0.5rem; font-size:0.875rem; font-weight:600; letter-spacing:.5px; }
+  .topbar .brand::before { content:""; display:block; width:2px; height:1rem; background:var(--red); }
+  .topbar .brand .car { font-size:1rem; filter:saturate(1.4); }
   .topbar .brand .name { color:var(--red); text-transform:uppercase; }
   .topbar .brand .chassis { color:var(--text-2); font-weight:500; }
-  .topbar .config { display:flex; gap:14px; align-items:center; color:var(--text-1); font-size:11.5px; padding:3px 10px; border-left:1px solid var(--border-1); cursor:pointer; transition:background .12s; }
+  .topbar .config { display:flex; gap:0.875rem; align-items:center; color:var(--text-1); font-size:0.719rem; padding:0.1875rem 0.625rem; border-left:1px solid var(--border-1); cursor:pointer; transition:background .12s; }
   .topbar .config:hover { background:var(--bg-hover); }
   .topbar .config:empty { display:none; }
-  .topbar .config .cfg { display:flex; align-items:baseline; gap:6px; }
-  .topbar .config .cfg-k { color:var(--text-3); text-transform:uppercase; font-size:10px; letter-spacing:.6px; }
-  .topbar .config .cfg-more { color:var(--text-3); font-size:10px; }
-  .topbar .age { color:var(--text-3); font-size:11px; margin-left:auto; font-variant-numeric:tabular-nums; }
+  .topbar .config .cfg { display:flex; align-items:baseline; gap:0.375rem; }
+  .topbar .config .cfg-k { color:var(--text-3); text-transform:uppercase; font-size:0.625rem; letter-spacing:.6px; }
+  .topbar .config .cfg-more { color:var(--text-3); font-size:0.625rem; }
+  .topbar .age { color:var(--text-3); font-size:0.6875rem; margin-left:auto; font-variant-numeric:tabular-nums; }
   .page {
     flex:1 1 0;
     min-height:0;
-    padding:8px;
-    max-width:1400px;
-    margin:0 auto;
+    padding:0.5rem;
+    /* Fill the full monitor width — no max-width cap. The page spans the whole
+       viewport (minus the padding gutter); the right-hand schedule column is
+       width-capped on its own, so the trigger graph absorbs the extra space on
+       wide/ultrawide displays. */
     width:100%;
     box-sizing:border-box;
     display:grid;
     /* stats (auto) · main content (flex) */
     grid-template-rows: auto minmax(0,1fr);
-    gap:6px;
+    gap:0.375rem;
     overflow:hidden;
   }
   /* Two-column body: left holds triggers above agents/events, right holds schedule. */
-  .main { display:grid; grid-template-columns: minmax(0,1fr) minmax(280px,360px); gap:6px; min-height:0; overflow:hidden; }
+  .main { display:grid; grid-template-columns: minmax(0,1fr) minmax(17.5rem,22.5rem); gap:0.375rem; min-height:0; overflow:hidden; }
   /* main-left is graph-over-blocks; weight 2.5:1 so the trigger graph gets
      ~70% of vertical room. Agents/events still scroll inside their block. */
-  .main-left { display:grid; grid-template-rows: minmax(0,2.5fr) minmax(0,1fr); gap:6px; min-height:0; overflow:hidden; }
+  .main-left { display:grid; grid-template-rows: minmax(0,2.5fr) minmax(0,1fr); gap:0.375rem; min-height:0; overflow:hidden; }
   .main-right { display:grid; grid-template-rows: minmax(0,1fr); min-height:0; overflow:hidden; }
-  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:6px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(10rem,1fr)); gap:0.375rem; }
   /* Stat tiles: flat hard-rect, no sheen, no drop shadow. Bloomberg-terminal
      feel — the data is the foreground, the chrome is invisible. */
   .stat { background:var(--bg-card);
-    border:1px solid var(--border-1); padding:5px 10px;
-    display:flex; flex-direction:column; gap:2px; min-height:0; }
-  .stat .label { color:var(--text-3); font-size:10px; text-transform:uppercase; letter-spacing:.8px; }
-  .stat .value { font-size:17px; font-weight:600; color:var(--text-1); line-height:1.1; font-variant-numeric:tabular-nums; }
+    border:1px solid var(--border-1); padding:0.3125rem 0.625rem;
+    display:flex; flex-direction:column; gap:0.125rem; min-height:0; }
+  .stat .label { color:var(--text-3); font-size:0.625rem; text-transform:uppercase; letter-spacing:.8px; }
+  .stat .value { font-size:1.0625rem; font-weight:600; color:var(--text-1); line-height:1.1; font-variant-numeric:tabular-nums; }
   .stat .value.warn { color:var(--danger-soft); }
-  .stat .value .sub { color:var(--text-3); font-size:10.5px; font-weight:400; }
-  .stat svg.gauge { display:block; width:100%; height:14px; margin-top:auto; }
+  .stat .value .sub { color:var(--text-3); font-size:0.656rem; font-weight:400; }
+  .stat svg.gauge { display:block; width:100%; height:0.875rem; margin-top:auto; }
   /* Each block is a grid with a fixed h3 header and a 1fr body that scrolls
    * when content overflows its grid cell — the page itself never scrolls.
    * Grid is more predictable than flex here: in a fixed-height outer row
@@ -767,10 +778,10 @@ INDEX_HTML = r"""<!doctype html>
    * sizes to its content without collapsing (which flex-basis:0 does).
    * Bloomberg-flat: hard 1px borders, no rounded corners, no shadows. */
   .block { background:var(--bg-card);
-    border:1px solid var(--border-1); padding:6px 12px 10px;
+    border:1px solid var(--border-1); padding:0.375rem 0.75rem 0.625rem;
     min-width:0; min-height:0; display:grid; grid-template-rows:auto minmax(0,1fr); overflow:hidden; }
   .block-body { min-height:0; overflow:auto; }
-  .blocks { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; min-height:0; overflow:hidden; }
+  .blocks { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0.375rem; min-height:0; overflow:hidden; }
   @media (max-width: 900px) {
     /* Narrow viewports: surrender the no-scroll constraint — stack and let the page scroll. */
     html, body { overflow:auto; height:auto; }
@@ -783,67 +794,67 @@ INDEX_HTML = r"""<!doctype html>
   }
   /* Section header: brand-red square + uppercase wordmark + strong hard rule.
      Square mark (not dot) tightens the terminal feel. */
-  .block h3 { margin:0 0 8px; padding-bottom:5px;
+  .block h3 { margin:0 0 0.5rem; padding-bottom:0.3125rem;
     border-bottom:1px solid var(--border-2);
-    font-size:11px; font-weight:700; color:var(--text-1);
+    font-size:0.6875rem; font-weight:700; color:var(--text-1);
     text-transform:uppercase; letter-spacing:1px;
-    display:flex; align-items:center; gap:7px; }
-  .block h3::before { content:""; width:6px; height:6px;
+    display:flex; align-items:center; gap:0.4375rem; }
+  .block h3::before { content:""; width:0.375rem; height:0.375rem;
     background:var(--red); box-shadow:0 0 6px rgba(239,68,68,0.55); flex:none; }
-  .dot { width:8px; height:8px; border-radius:50%; display:inline-block; flex:none; }
+  .dot { width:0.5rem; height:0.5rem; border-radius:50%; display:inline-block; flex:none; }
   .dot.up { background:var(--green); }
   .dot.down { background:var(--danger); }
   /* Running = brand red pulsing (the chassis is actively doing work, not in
      an error state — distinct from .down which uses danger). */
   .dot.running { background:var(--red); animation: pulse 1.5s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity:1; box-shadow:0 0 0 0 var(--red-dim); } 50% { opacity:.55; box-shadow:0 0 0 3px transparent; } }
-  .line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:1px 0; }
+  .line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:0.0625rem 0; }
   .line.deny { color:var(--danger); }
   .ts { color:var(--text-3); display:inline-block; min-width:5.5em; }
-  table { width:100%; border-collapse:collapse; font-size:12px; }
-  td { padding:2px 10px 2px 0; vertical-align:top; }
+  table { width:100%; border-collapse:collapse; font-size:0.75rem; }
+  td { padding:0.125rem 0.625rem 0.125rem 0; vertical-align:top; }
   td.k { color:var(--text-2); white-space:nowrap; }
-  .empty { color:var(--text-3); font-style:italic; font-size:11.5px; padding:4px 0; }
+  .empty { color:var(--text-3); font-style:italic; font-size:0.719rem; padding:0.25rem 0; }
   /* Code wells: deep-recessed surface + 1px ring. Flat — no inner shadow. */
-  code { background:var(--bg-input); padding:1px 5px; font-size:11px; color:var(--text-1);
+  code { background:var(--bg-input); padding:0.0625rem 0.3125rem; font-size:0.6875rem; color:var(--text-1);
     border:1px solid var(--border-1); }
   /* Pills: hard-rect tag, no rounded curve, no shadow. */
-  .pill { display:inline-block; padding:0 6px; font-size:10px;
+  .pill { display:inline-block; padding:0 0.375rem; font-size:0.625rem;
     background:var(--bg-sub); color:var(--text-2); border:1px solid var(--border-1);
     text-transform:uppercase; letter-spacing:.4px; }
   .pill.bad { color:var(--danger-soft); border-color:var(--danger-dim); }
   .clickable { cursor:pointer; }
   .clickable:hover { background:var(--bg-hover); }
-  .error-page { padding:40px; color:var(--danger); font-size:13px; }
+  .error-page { padding:2.5rem; color:var(--danger); font-size:0.8125rem; }
   .modal { position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center; }
   .modal[hidden] { display:none; }
   .modal-backdrop { position:absolute; inset:0; background:rgba(0,0,0,.78); }
   .modal-body { position:relative;
     background:var(--bg-card);
     border:1px solid var(--border-2);
-    max-width:min(90vw,1100px); max-height:85vh; min-width:480px;
+    max-width:min(90vw,1100px); max-height:85vh; min-width:min(90vw,30rem);
     display:flex; flex-direction:column;
     box-shadow: 0 24px 48px rgba(0,0,0,0.55); }
-  .modal-head { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-bottom:1px solid var(--border-1); gap:12px; }
-  .modal-title { font-size:13px; font-weight:600; flex:1; color:var(--text-1); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .modal-close { background:none; border:none; color:var(--text-3); cursor:pointer; font-size:14px; padding:0 4px; }
+  .modal-head { display:flex; align-items:center; justify-content:space-between; padding:0.625rem 0.875rem; border-bottom:1px solid var(--border-1); gap:0.75rem; }
+  .modal-title { font-size:0.8125rem; font-weight:600; flex:1; color:var(--text-1); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .modal-close { background:none; border:none; color:var(--text-3); cursor:pointer; font-size:0.875rem; padding:0 0.25rem; }
   .modal-close:hover { color:var(--text-1); }
-  .modal-content { padding:12px 14px; overflow:auto; flex:1; font-size:11.5px; }
+  .modal-content { padding:0.75rem 0.875rem; overflow:auto; flex:1; font-size:0.719rem; }
   .modal-content pre { white-space:pre-wrap; word-break:break-word; margin:0; font-family:inherit; color:var(--text-1); }
-  .modal-content table { margin-top:4px; }
-  .modal-content td { padding:3px 10px 3px 0; }
+  .modal-content table { margin-top:0.25rem; }
+  .modal-content td { padding:0.1875rem 0.625rem 0.1875rem 0; }
   .modal-content a.link { color:var(--text-1); cursor:pointer; text-decoration:underline; text-decoration-color:var(--text-3); }
   .modal-content a.link:hover { text-decoration-color:var(--red); }
-  .modal-content .back { display:inline-block; margin-bottom:8px; color:var(--text-3); cursor:pointer; }
+  .modal-content .back { display:inline-block; margin-bottom:0.5rem; color:var(--text-3); cursor:pointer; }
   .modal-content .back:hover { color:var(--text-1); }
-  .modal-content .kv { display:grid; grid-template-columns:max-content 1fr; gap:6px 18px; }
-  .modal-content .kv dt { color:var(--text-3); text-transform:uppercase; font-size:10px; letter-spacing:.6px; align-self:center; }
+  .modal-content .kv { display:grid; grid-template-columns:max-content 1fr; gap:0.375rem 1.125rem; }
+  .modal-content .kv dt { color:var(--text-3); text-transform:uppercase; font-size:0.625rem; letter-spacing:.6px; align-self:center; }
   .modal-content .kv dd { margin:0; color:var(--text-1); word-break:break-all; }
   .graph-wrap { overflow:hidden; padding:0; position:relative; }
   .graph { display:block; width:100%; height:100%; cursor:grab; touch-action:none; user-select:none; }
   .graph.panning { cursor:grabbing; }
   /* In the hero block, the graph fills the available vertical space above the legend. */
-  .hero-graph .block-body { display:flex; flex-direction:column; gap:6px; }
+  .hero-graph .block-body { display:flex; flex-direction:column; gap:0.375rem; }
   .hero-graph .graph-wrap { flex:1 1 0; min-height:0; }
   .hero-graph .graph-legend { flex:0 0 auto; margin-top:0; }
   .graph .node rect { fill:var(--bg-sub); stroke:var(--border-2); transition:stroke .12s; }
@@ -884,19 +895,19 @@ INDEX_HTML = r"""<!doctype html>
      green and fades back to invisible over a minute. Outside the main rect so
      it doesn't fight the .running stroke animation. */
   .graph .node .halo { fill:none; stroke:var(--green); stroke-width:2.5; pointer-events:none; }
-  .graph-legend { display:flex; gap:14px; margin-top:8px; font-size:10.5px; color:var(--text-3); flex-wrap:wrap; }
-  .graph-legend .swatch { display:inline-block; width:14px; height:2px; vertical-align:middle; margin-right:5px; }
+  .graph-legend { display:flex; gap:0.875rem; margin-top:0.5rem; font-size:0.656rem; color:var(--text-3); flex-wrap:wrap; }
+  .graph-legend .swatch { display:inline-block; width:0.875rem; height:2px; vertical-align:middle; margin-right:0.3125rem; }
   .graph-legend .swatch.dashed { border-top:1.5px dashed var(--text-3); height:0; }
-  .agenda { display:flex; flex-direction:column; gap:1px; max-width:640px; }
-  .agenda-band { color:var(--text-3); font-size:10px; text-transform:uppercase; letter-spacing:1px; padding:7px 0 2px; margin-top:5px; border-top:1px solid var(--border-1); }
-  .agenda-band:first-child { border-top:none; margin-top:0; padding-top:1px; }
-  .agenda-row { display:flex; gap:12px; padding:1px 4px; align-items:baseline; font-size:12px; line-height:1.35; border-radius:2px; }
+  .agenda { display:flex; flex-direction:column; gap:1px; max-width:40rem; }
+  .agenda-band { color:var(--text-3); font-size:0.625rem; text-transform:uppercase; letter-spacing:1px; padding:0.4375rem 0 0.125rem; margin-top:0.3125rem; border-top:1px solid var(--border-1); }
+  .agenda-band:first-child { border-top:none; margin-top:0; padding-top:0.0625rem; }
+  .agenda-row { display:flex; gap:0.75rem; padding:0.0625rem 0.25rem; align-items:baseline; font-size:0.75rem; line-height:1.35; border-radius:2px; }
   .agenda-row.alt { background:rgba(255,255,255,0.025); }
-  .agenda-when { flex:0 0 88px; color:var(--text-2); font-variant-numeric:tabular-nums; text-align:right; }
+  .agenda-when { flex:0 0 5.5rem; color:var(--text-2); font-variant-numeric:tabular-nums; text-align:right; }
   .agenda-label { color:var(--text-1); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
-  .ev-kind { display:inline-block; min-width:34px; font-size:9.5px; color:var(--text-3); text-transform:uppercase; letter-spacing:.6px; margin-right:4px; }
-  .badges { position:fixed; bottom:8px; right:10px; display:flex; gap:6px; z-index:40; pointer-events:none; }
-  .badge { padding:1px 7px; font-size:10px; font-weight:700; letter-spacing:1px; text-transform:uppercase; border:1px solid;
+  .ev-kind { display:inline-block; min-width:2.125rem; font-size:0.594rem; color:var(--text-3); text-transform:uppercase; letter-spacing:.6px; margin-right:0.25rem; }
+  .badges { position:fixed; bottom:0.5rem; right:0.625rem; display:flex; gap:0.375rem; z-index:40; pointer-events:none; }
+  .badge { padding:0.0625rem 0.4375rem; font-size:0.625rem; font-weight:700; letter-spacing:1px; text-transform:uppercase; border:1px solid;
     background:var(--bg-card); }
   .badge.beta { color:var(--red); border-color:var(--red-dim); background:rgba(239,68,68,0.1); }
 </style>
