@@ -52,4 +52,12 @@ auth of its own, so the tailnet ACL is the access control — don't combine
 
 The drill-in panel calls `/api/file/{container}?path=...`. Reads are
 restricted to `/home/agent/.pi/` and `/var/log/chassis/` and capped at
-200 KB (last bytes). The endpoint is not a generic shell.
+200 KB (last bytes). The endpoint is not a generic shell. A project panel
+can extend the allowlist via `FILE_PREFIXES` (see below).
+
+## Extending the dashboard
+
+A project layered on chassis can add its own panels by dropping modules into
+[`panels/`](./panels/) — no fork of `app.py` required. With no panels present
+the dashboard is byte-identical to stock. See [`panels/README.md`](./panels/README.md)
+for the panel contract.

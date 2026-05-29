@@ -30,10 +30,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import os
 import re
 import shlex
+import sys
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI
@@ -73,6 +75,54 @@ _SAFE_NAME = re.compile(r"^[a-zA-Z0-9_.-]+$")
 
 def _safe_name(s: str) -> bool:
     return bool(_SAFE_NAME.match(s))
+
+
+# ---------- panels (project extension seam) -------------------------------
+# A project layered on chassis (e.g. via an overlay build) can drop panel
+# modules into dashboard/panels/<name>.py to contribute project-specific
+# server data, client JS/CSS, and read-allowlist prefixes — without forking
+# this file. With no panels present the dashboard is byte-identical and the
+# seam is wholly inert. See dashboard/panels/README.md for the contract.
+PANELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panels")
+PANELS: list = []
+
+
+def load_panels() -> None:
+    """Discover + import panel modules from PANELS_DIR. Called at import time so
+    both the normal launch and the --reload "app:app" re-import pick panels up.
+    A module registers only if it exposes a truthy ID; its FILE_PREFIXES are
+    unioned into the /api/file allowlist. One bad panel is logged and skipped —
+    it never takes the dashboard down."""
+    global ALLOWED_FILE_PREFIXES
+    PANELS.clear()
+    if not os.path.isdir(PANELS_DIR):
+        return
+    for fname in sorted(os.listdir(PANELS_DIR)):
+        if not fname.endswith(".py") or fname.startswith("_"):
+            continue
+        path = os.path.join(PANELS_DIR, fname)
+        mod_name = f"chassis_panel_{fname[:-3]}"
+        try:
+            spec = importlib.util.spec_from_file_location(mod_name, path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[mod_name] = mod
+            spec.loader.exec_module(mod)
+        except Exception as e:  # noqa: BLE001
+            print(f"chassis dashboard: failed to load panel {fname}: {e}",
+                  file=sys.stderr)
+            continue
+        if not getattr(mod, "ID", None):
+            continue
+        PANELS.append(mod)
+        prefixes = getattr(mod, "FILE_PREFIXES", ())
+        if prefixes:
+            # dict.fromkeys de-dups while preserving order.
+            ALLOWED_FILE_PREFIXES = tuple(
+                dict.fromkeys(ALLOWED_FILE_PREFIXES + tuple(prefixes))
+            )
+
+
+load_panels()
 
 
 async def sh(*cmd: str, timeout: float = 5.0) -> tuple[int, str, str]:
@@ -572,6 +622,17 @@ async def chassis_snapshot(meta: dict) -> dict:
     snap["tasks"] = tasks
     snap["fires"] = fires
     snap["config"] = config
+    if PANELS:
+        async def _snap(p):
+            fn = getattr(p, "snapshot", None)
+            if fn is None:
+                return None
+            try:
+                return await fn(name, exec_in)
+            except Exception as e:  # noqa: BLE001
+                return {"_error": str(e)}
+        res = await asyncio.gather(*(_snap(p) for p in PANELS))
+        snap["panels"] = {p.ID: r for p, r in zip(PANELS, res)}
     return snap
 
 
@@ -910,6 +971,7 @@ INDEX_HTML = r"""<!doctype html>
   .badge { padding:0.0625rem 0.4375rem; font-size:0.625rem; font-weight:700; letter-spacing:1px; text-transform:uppercase; border:1px solid;
     background:var(--bg-card); }
   .badge.beta { color:var(--red); border-color:var(--red-dim); background:rgba(239,68,68,0.1); }
+  /* CHASSIS_PANEL_CSS */
 </style>
 </head>
 <body>
@@ -1406,7 +1468,26 @@ function renderPage(c){
       <div class="main-right">
         <div class="block"><h3>schedule</h3><div class="block-body">${renderSchedule(c.cron)}</div></div>
       </div>
-    </div>`;
+    </div>
+    ${renderPanels(c)}`;
+}
+
+// --- project panels (extension seam) -------------------------------------
+// Panel modules (dashboard/panels/*.py) inject JS at CHASSIS_PANEL_JS that
+// calls registerPanel(); each renders a full-width .block below the main grid
+// from its slice of chassis.panels[id]. render(data, chassis) is sync — the
+// data is already in the snapshot. With no panels the registry stays empty and
+// renderPanels emits "" → the page is unchanged.
+const PANELS=[];
+function registerPanel(p){ PANELS.push(p); }
+function renderPanels(c){
+  if(!PANELS.length) return "";
+  return PANELS.map(p=>{
+    let body;
+    try{ body = p.render ? p.render(c.panels?.[p.id], c) : ""; }
+    catch(e){ body = `<div class="empty">panel error: ${escape(e.message)}</div>`; }
+    return `<div class="block" id="panel-${escape(p.id)}"><h3>${escape(p.title||p.id)}</h3><div class="block-body">${body}</div></div>`;
+  }).join("");
 }
 
 // --- modal ---------------------------------------------------------------
@@ -1655,6 +1736,7 @@ async function tick(){
 }
 tick();
 setInterval(tick,3000);
+/* CHASSIS_PANEL_JS */
 </script>
 <div class="badges">
   <span class="badge beta">beta</span>
@@ -1664,9 +1746,20 @@ setInterval(tick,3000);
 """
 
 
+def render_index() -> str:
+    """Splice each registered panel's CSS/JS into INDEX_HTML at the two panel
+    markers. With no panels both markers collapse to "" → the page is
+    byte-identical to the stock dashboard (minus the marker comments)."""
+    css = "\n".join(getattr(p, "CSS", "") or "" for p in PANELS)
+    js = "\n".join(getattr(p, "JS", "") or "" for p in PANELS)
+    return (INDEX_HTML
+            .replace("/* CHASSIS_PANEL_CSS */", css)
+            .replace("/* CHASSIS_PANEL_JS */", js))
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    return INDEX_HTML
+    return render_index()
 
 
 def main() -> None:
