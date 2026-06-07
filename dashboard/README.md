@@ -208,6 +208,17 @@ CHASSIS_BRAND_TITLE=My Monitor  # <title> (default "chassis")
 CHASSIS_BRAND_EMOJI=🚀          # favicon + topbar mark (default 🏎️)
 ```
 
+### Dashboard — project panels (server + client)
+
+Beyond recoloring, a project can add whole panels — server-side data plus
+client JS/CSS — by dropping modules into [`panels/`](./panels/), no fork of
+`app.py` required. Each module's `snapshot()` result is injected at
+`chassis.panels[ID]`, its CSS/JS are spliced into the page at the two markers,
+and it can widen the `/api/file` allowlist via `FILE_PREFIXES`. Panels are
+auto-discovered at import time. With no panels present the dashboard is
+byte-identical to stock. See [`panels/README.md`](./panels/README.md) for the
+full contract and security note.
+
 ### Importing the modules
 
 The hooks above need the modules importable. `tui.py` and `app.py` are both
@@ -238,4 +249,6 @@ auth of its own, so the tailnet ACL is the access control — don't combine
 
 The drill-in panel calls `/api/file/{container}?path=...`. Reads are
 restricted to `/home/agent/.pi/` and `/var/log/chassis/` and capped at
-200 KB (last bytes). The endpoint is not a generic shell.
+200 KB (last bytes). The endpoint is not a generic shell. A project panel
+can extend the allowlist via `FILE_PREFIXES` (see
+[Extending](#extending) → project panels).
