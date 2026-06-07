@@ -64,6 +64,17 @@ FILE_MAX_BYTES = 200_000
 # the value chosen on the command line.
 CHASSIS_NAME: str | None = os.environ.get("CHASSIS_NAME") or None
 
+# Branding / palette overrides for a downstream app (all default to stock, so
+# unset env → byte-identical page). See dashboard/README.md § Extending.
+#   CHASSIS_THEME_CSS  — path to a .css appended after the base <style>; a later
+#                        `:root { --red: … }` wins by CSS cascade (override only
+#                        the vars you change). JS gauge/edge colors follow it.
+#   CHASSIS_BRAND_*    — wordmark text, favicon emoji, and <title>.
+THEME_CSS = os.environ.get("CHASSIS_THEME_CSS") or None
+BRAND_NAME = os.environ.get("CHASSIS_BRAND_NAME", "chassis")
+BRAND_EMOJI = os.environ.get("CHASSIS_BRAND_EMOJI", "🏎️")
+BRAND_TITLE = os.environ.get("CHASSIS_BRAND_TITLE", "chassis")
+
 # Stamped at module import; changes whenever the server restarts. The dashboard
 # polls this so the browser auto-reloads after a --reload-triggered restart.
 SERVER_BOOT = datetime.now(timezone.utc).isoformat()
@@ -596,6 +607,13 @@ async def resolve_chassis() -> tuple[dict | None, str | None]:
 
 app = FastAPI(title="chassis dashboard")
 
+# Public extension surface — what a downstream app builds on. See
+# dashboard/README.md § Extending.
+__all__ = [
+    "app", "main", "render_index", "INDEX_HTML", "resolve_chassis",
+    "CHASSIS_NAME", "docker_ps_chassis", "docker_inspect",
+]
+
 
 @app.get("/api/state")
 async def api_state():
@@ -710,6 +728,14 @@ INDEX_HTML = r"""<!doctype html>
     --danger-soft: #fcd34d;
     --danger-dim:  #4a3406;
     --green:       #4ade80;
+    /* Colors the trigger graph + CPU/mem gauge read from JS via getComputedStyle
+       (see EDGE_COLORS / GAUGE_LIT_* below). Kept as vars so a CHASSIS_THEME_CSS
+       override flows through to the canvas/SVG too. --edge-after has no other
+       home (the "after" edge is a neutral grey distinct from --text-3); the
+       gauge endpoints default to --green/--red. */
+    --edge-after:  #808080;
+    --gauge-lo:    #4ade80;
+    --gauge-hi:    #ef4444;
   }
   html, body { height:100%; }
   html { overflow:hidden; }
@@ -946,9 +972,26 @@ const GAUGE_W = 120, GAUGE_H = 24, GAUGE_BAR_Y = 5, GAUGE_BAR_H = 14;
 const GAUGE_SEGMENTS = 44;
 const GAUGE_SEG_GAP  = 0.5;
 const GAUGE_SEG_W    = (GAUGE_W - GAUGE_SEG_GAP * (GAUGE_SEGMENTS - 1)) / GAUGE_SEGMENTS;
-const GAUGE_DIM      = "#262626";   // --border-1 — unlit segments
-const GAUGE_LIT_LO   = [0x4a, 0xde, 0x80];  // --green (cool end)
-const GAUGE_LIT_HI   = [0xef, 0x44, 0x44];  // --red (hot end)
+// Read a CSS custom property at startup, falling back to a literal so the
+// default render is pixel-identical and any CHASSIS_THEME_CSS override flows
+// through to the JS-drawn canvas/SVG (single source of truth: the palette).
+const cssVar = (n, fb) => (getComputedStyle(document.documentElement)
+                            .getPropertyValue(n).trim() || fb);
+// Normalize a CSS color (#rgb, #rrggbb, or rgb()/rgba() — browsers vary on
+// what getComputedStyle returns) to an [r,g,b] int triple for arithmetic.
+function toRGB(c){
+  c = String(c).trim();
+  let m = c.match(/^#([0-9a-f]{3})$/i);
+  if(m){const h=m[1]; return [parseInt(h[0]+h[0],16),parseInt(h[1]+h[1],16),parseInt(h[2]+h[2],16)];}
+  m = c.match(/^#([0-9a-f]{6})$/i);
+  if(m){return [parseInt(m[1].slice(0,2),16),parseInt(m[1].slice(2,4),16),parseInt(m[1].slice(4,6),16)];}
+  m = c.match(/rgba?\(([^)]+)\)/i);
+  if(m){const p=m[1].split(",").map(x=>parseFloat(x)); return [p[0]|0,p[1]|0,p[2]|0];}
+  return [0,0,0];
+}
+const GAUGE_DIM      = cssVar("--border-1", "#262626");   // unlit segments
+const GAUGE_LIT_LO   = toRGB(cssVar("--gauge-lo", "#4ade80"));  // --green (cool end)
+const GAUGE_LIT_HI   = toRGB(cssVar("--gauge-hi", "#ef4444"));  // --red (hot end)
 function gaugeColor(t){
   // t = position along the bar in [0,1]. Linear RGB lerp from green to red.
   const f = Math.max(0, Math.min(t, 1));
@@ -1138,7 +1181,11 @@ function layoutTasks(tasks){
 
 // Arrow-marker fill colors are pulled from the same palette as the .edge
 // stroke rules so the marker and line stay in sync per kind.
-const EDGE_COLORS = { after: "#808080", on_success: "#4ade80", on_failure: "#f59e0b" };
+const EDGE_COLORS = {
+  after:      cssVar("--edge-after", "#808080"),
+  on_success: cssVar("--green",      "#4ade80"),
+  on_failure: cssVar("--danger",     "#f59e0b"),
+};
 
 // Char budgets chosen so the longest "natural" labels (e.g. "⏱ */5 * * * * ·
 // next 12m ago", "↳ on_success reviewer/critique") fit inside the node at the
@@ -1664,9 +1711,33 @@ setInterval(tick,3000);
 """
 
 
+def render_index() -> str:
+    """INDEX_HTML with branding + palette overrides applied. Every step is a
+    no-op when the env vars hold their defaults, so the unset-env page is
+    byte-identical to the raw constant."""
+    html = INDEX_HTML
+    # Branding — targeted, unique replacements (no-ops at default values).
+    html = html.replace("<title>chassis</title>", f"<title>{BRAND_TITLE}</title>")
+    html = html.replace('<span class="name">chassis</span>',
+                        f'<span class="name">{BRAND_NAME}</span>')
+    html = html.replace("🏎️", BRAND_EMOJI)  # favicon + topbar car
+    # Palette — append the override stylesheet after the base </style>; a later
+    # `:root { --x: … }` wins by cascade, so a downstream file lists only the
+    # vars it changes. JS gauge/edge colors read these via getComputedStyle, so
+    # they follow automatically. A bad path/read must never 500 the page.
+    if THEME_CSS:
+        try:
+            with open(THEME_CSS, encoding="utf-8") as fh:
+                css = fh.read()
+            html = html.replace("</style>", f"</style>\n<style>\n{css}\n</style>", 1)
+        except OSError:
+            pass  # fall back to stock palette
+    return html
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    return INDEX_HTML
+    return render_index()
 
 
 def main() -> None:

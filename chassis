@@ -28,6 +28,7 @@ REPO = Path(__file__).resolve().parent
 ENV_EXAMPLE = REPO / ".env.example"
 ENV_FILE = REPO / ".env"
 LLM_ENV_FILE = REPO / "harness" / "llm.env"
+DASHBOARD_TUI = REPO / "dashboard" / "tui.py"
 
 
 def chassis_name() -> str:
@@ -436,6 +437,24 @@ def cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tui(args: argparse.Namespace) -> int:
+    """Launch the btop-style terminal monitor (dashboard/tui.py) against this
+    branch's chassis. The TUI shells out to docker itself, so this just spawns
+    it with the right target. Prefer `uv` so its lone dep (croniter) resolves;
+    fall back to plain python (next-fire times go blank without croniter)."""
+    if not DASHBOARD_TUI.exists():
+        die(f"{DASHBOARD_TUI} missing")
+    target = args.chassis or CONTAINER
+    extra = ["--chassis", target]
+    if args.interval is not None:
+        extra += ["--interval", str(args.interval)]
+    if shutil.which("uv"):
+        launcher = ["uv", "run", "--script", str(DASHBOARD_TUI)]
+    else:
+        launcher = [sys.executable, str(DASHBOARD_TUI)]
+    return run([*launcher, *extra]).returncode
+
+
 HELP_DESCRIPTION = """\
 chassis — host CLI for a Docker-based agent fleet.
 
@@ -490,6 +509,13 @@ def main() -> int:
     p_logs = sub.add_parser("logs", help="tail dispatcher audit log, or per-agent run logs")
     p_logs.add_argument("agent", nargs="?", default=None, help="agent name; omit for dispatcher audit log")
     p_logs.set_defaults(func=cmd_logs)
+
+    p_tui = sub.add_parser("tui", help="btop-style terminal monitor (CPU/mem graphs, tasks, audit, triggers)")
+    p_tui.add_argument("--chassis", metavar="NAME", default=None,
+                       help=f"container to monitor (default: this branch's {CONTAINER})")
+    p_tui.add_argument("--interval", type=float, default=None,
+                       help="docker poll interval in seconds (default 2.0)")
+    p_tui.set_defaults(func=cmd_tui)
 
     # maintenance
     sub.add_parser("reload-cron", help="re-render tools-public.json + cron (no restart)").set_defaults(func=cmd_reload_cron)
