@@ -143,8 +143,12 @@ if [[ -d "$TEMPLATE_DIR" ]] && [[ ! -f "$SEED_MARKER" ]]; then
     echo "entrypoint: seeded $AGENT_HOME from template"
 fi
 
-# Log dir (named volume; first mount is root:root)
-mkdir -p "$LOG_DIR/agents"
+# Log dir (named volume; first mount is root:root). `verdicts/` holds one
+# short-lived file per task run: written by the agent user, appended to by the
+# dispatcher as root, removed by run-agent once read. It lives here rather than
+# in /tmp because /tmp is sticky and world-writable, where fs.protected_regular
+# refuses the cross-uid open — see run-agent.
+mkdir -p "$LOG_DIR/agents" "$LOG_DIR/verdicts"
 chown -R agent:agent "$LOG_DIR"
 touch "$LOG_DIR/cron.log"
 chown agent:agent "$LOG_DIR/cron.log"

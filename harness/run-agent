@@ -125,8 +125,19 @@ if [[ -n "$task" ]]; then
     # pi exits we slurp them into the VERDICT assoc array so fire_triggers
     # can evaluate `when` clauses against the task's published verdicts.
     # $$-$(date +%s%N) keeps the path unique across overlapping runs.
+    #
+    # Deliberately NOT /tmp, which is where this lived and where it did not
+    # work. This file is created by the agent user and appended to by the
+    # dispatcher running as root, and `fs.protected_regular` refuses an
+    # O_CREAT open of a file in a world-writable **sticky** directory when the
+    # file's owner matches neither the directory's owner nor the caller — root
+    # included, because the check runs before the capability check. Every
+    # verdict call came back `PermissionError: [Errno 13]` and the task still
+    # exited 0. $LOG_DIR is not sticky, so the two uids can share a file there.
+    VERDICT_DIR="$LOG_DIR/verdicts"
+    mkdir -p "$VERDICT_DIR" 2>/dev/null || true
     CHASSIS_RUN_ID="${agent}-${task}-$$-$(date +%s%N)"
-    export CHASSIS_VERDICT_FILE="/tmp/chassis-verdict-${CHASSIS_RUN_ID}"
+    export CHASSIS_VERDICT_FILE="$VERDICT_DIR/${CHASSIS_RUN_ID}"
     : > "$CHASSIS_VERDICT_FILE"
 fi
 
