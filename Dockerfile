@@ -45,7 +45,24 @@ COPY harness/entrypoint.sh /usr/local/bin/chassis-entrypoint
 RUN chmod 755 /usr/local/bin/run-tool /usr/local/bin/run-agent /usr/local/bin/chassis-entrypoint
 
 # Sudoers: agent can call the dispatcher with no password, nothing else.
-RUN echo 'agent ALL=(root) NOPASSWD: /usr/local/bin/run-tool' > /etc/sudoers.d/chassis \
+#
+# `env_keep` for exactly the three CHASSIS_* context variables, and no more. sudo
+# scrubs the caller's environment by default, so without this the dispatcher sees
+# no $CHASSIS_VERDICT_FILE and the `verdict` tool cannot publish — which is how it
+# failed in the field: `sudo: sorry, you are not allowed to set the following
+# environment variables`, reported to the model as a tool result it read as an
+# environment quirk and worked around. The task still exited 0. A silently
+# unavailable tool dispatcher is worse than a broken one.
+#
+# Deliberately NOT the `SETENV:` tag, which would have been the one-word fix.
+# SETENV lets the caller pass *any* variable through `sudo -E`, including PATH —
+# and run-tool resolves its runner with `shutil.which`, so a forged PATH would be
+# arbitrary code as root. env_keep names three variables and grants nothing else.
+RUN printf '%s\n' \
+      'Cmnd_Alias CHASSIS_TOOL = /usr/local/bin/run-tool' \
+      'Defaults!CHASSIS_TOOL env_keep += "CHASSIS_VERDICT_FILE CHASSIS_AGENT CHASSIS_TASK"' \
+      'agent ALL=(root) NOPASSWD: CHASSIS_TOOL' \
+      > /etc/sudoers.d/chassis \
  && chmod 440 /etc/sudoers.d/chassis \
  && visudo -c -f /etc/sudoers.d/chassis
 

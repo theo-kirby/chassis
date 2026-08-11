@@ -84,17 +84,17 @@ function makeTool(meta: PublicTool) {
       _ctx: ExtensionContext,
     ) {
       const json = JSON.stringify(params ?? {});
-      // Preserve CHASSIS_* through sudo so the dispatcher can forward them to
-      // the tool's child env. Without --preserve-env, sudo strips the caller's
-      // environment and the `verdict` tool would see no $CHASSIS_VERDICT_FILE.
+      // CHASSIS_* reach the dispatcher via `env_keep` in /etc/sudoers.d/chassis,
+      // not via `--preserve-env`. That flag needs the `SETENV:` sudoers tag, and
+      // without it sudo refuses the call outright — "sorry, you are not allowed
+      // to set the following environment variables" — so every tool run failed
+      // and the model was handed a message it read as an environment quirk.
+      // Granting SETENV would have fixed the symptom and opened a hole: it lets
+      // the caller pass any variable, PATH included, into a root command that
+      // resolves its runner from PATH.
       const result = spawnSync(
         "sudo",
-        [
-          "--preserve-env=CHASSIS_VERDICT_FILE,CHASSIS_AGENT,CHASSIS_TASK",
-          "/usr/local/bin/run-tool",
-          meta.name,
-          json,
-        ],
+        ["/usr/local/bin/run-tool", meta.name, json],
         { encoding: "utf8", env: process.env as Record<string, string> },
       );
       const stdout = result.stdout || "";

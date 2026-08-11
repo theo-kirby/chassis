@@ -47,6 +47,13 @@ EXIT_OK = 0
 EXIT_USAGE = 1
 EXIT_VALIDATION = 2
 
+# Fixed, not inherited. This process runs as root on behalf of an unprivileged
+# caller, and it resolves its runner with `shutil.which` — so a PATH that came
+# from the caller would be a way to have root execute the caller's binary. The
+# child env below is described as a clean baseline; taking PATH from the
+# environment quietly made that untrue.
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 
 def load_manifest() -> dict:
     with open(MANIFEST_PATH) as f:
@@ -147,7 +154,7 @@ def main() -> int:
     secret_values = {k: all_env_vals[k] for k in secret_keys if k in all_env_vals}
 
     child_env = {
-        "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        "PATH": SAFE_PATH,
         "HOME": "/root",
         "LANG": os.environ.get("LANG", "C.UTF-8"),
     }
@@ -165,7 +172,9 @@ def main() -> int:
         return deny(record, "tool entry missing 'script'")
     script_path = TOOLS_DIR / script_rel
     runner = tool.get("runner", "python3")
-    runner_path = shutil.which(runner) or runner
+    # Resolved against SAFE_PATH, not the inherited one: `which` defaults to
+    # os.environ["PATH"], which is the caller's, and this runs as root.
+    runner_path = shutil.which(runner, path=SAFE_PATH) or runner
 
     cmd = [runner_path, str(script_path), raw_args]
 
