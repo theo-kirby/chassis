@@ -3,9 +3,12 @@ FROM node:20-bookworm-slim
 ENV TZ=UTC \
     DEBIAN_FRONTEND=noninteractive
 
+# git is here rather than left to downstream images because an agent chassis
+# without it is a surprise: cloning, diffing and committing are table stakes
+# for anything the agent does in its own workspace.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip \
-      sudo cron tini ca-certificates tzdata curl \
+      sudo cron tini ca-certificates tzdata curl git \
  && rm -rf /var/lib/apt/lists/*
 
 # --break-system-packages: Debian 12 marks the system python externally-managed

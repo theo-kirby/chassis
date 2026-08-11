@@ -22,13 +22,21 @@ import time
 import uuid
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 REPO = Path(__file__).resolve().parent
 ENV_EXAMPLE = REPO / ".env.example"
 ENV_FILE = REPO / ".env"
 LLM_ENV_FILE = REPO / "harness" / "llm.env"
 DASHBOARD_TUI = REPO / "dashboard" / "tui.py"
+VAR_DIR = REPO / "var"
+IMAGE_OVERRIDE = VAR_DIR / "compose.image.yaml"
+
+# Where `chassis run --detach` keeps its bookkeeping, inside the logs volume so
+# it survives a container restart and lands in any harvest of /var/log/chassis.
+# Per handle: <h>.pgid (process-group id), <h>.task (agent TAB task), <h>.log
+# (combined output), <h>.rc (exit status, written only on clean completion).
+RUN_DIR = "/var/log/chassis/runs"
 
 
 def chassis_name() -> str:
@@ -158,6 +166,67 @@ def exec_in(cmd: list[str], *, user: str = "agent", interactive: bool = False) -
     return run(["docker", "exec", *flags, "-u", user, CONTAINER, *cmd]).returncode
 
 
+def exec_script(script: str, *args: str, user: str = "agent"
+                ) -> subprocess.CompletedProcess:
+    """Run a bash script inside the container with the script on **stdin**.
+
+    Never argv: a script piped in does not appear in the container's process
+    list, so anything it interpolates stays out of `ps`. Positional args land
+    as $1, $2, … (`bash -s <args>`).
+    """
+    return run(
+        ["docker", "exec", "-i", "-u", user, CONTAINER, "bash", "-s", "--", *args],
+        input=script, capture_output=True, text=True,
+    )
+
+
+def container_running() -> bool:
+    ps = run(["docker", "ps", "--filter", f"name=^{CONTAINER}$", "--format", "{{.Names}}"],
+             capture_output=True, text=True)
+    return CONTAINER in (ps.stdout or "")
+
+
+def require_container() -> None:
+    if not container_running():
+        die(f"{CONTAINER} is not running — run `chassis up` first.")
+
+
+def agent_home() -> str:
+    """The container's AGENT_HOME, matching run-agent's own fallback.
+
+    Only set when an operator puts it in compose `environment:`/`env_file:`
+    (e.g. per-user subdirs on a shared mount); otherwise /home/agent.
+    """
+    got = run(["docker", "exec", CONTAINER, "printenv", "AGENT_HOME"],
+              capture_output=True, text=True)
+    return (got.stdout or "").strip() or "/home/agent"
+
+
+def image_present(ref: str) -> bool:
+    return run(["docker", "image", "inspect", ref],
+               capture_output=True, text=True).returncode == 0
+
+
+def image_identity(ref: str) -> dict[str, object]:
+    """`{"ref", "id", "digests"}` for a local image — what a run should record.
+
+    The image id is the content hash of what actually ran; RepoDigests are the
+    registry digests when the image came from (or was pushed to) one. An
+    experiment that records these has the environment as a constant rather
+    than a hope.
+    """
+    got = run(["docker", "image", "inspect", ref, "--format",
+               "{{.Id}}\t{{json .RepoDigests}}"], capture_output=True, text=True)
+    if got.returncode != 0:
+        return {"ref": ref, "id": "", "digests": []}
+    image_id, _, digests = (got.stdout or "").strip().partition("\t")
+    try:
+        parsed = json.loads(digests) if digests else []
+    except ValueError:
+        parsed = []
+    return {"ref": ref, "id": image_id, "digests": parsed}
+
+
 def cmd_init(_args: argparse.Namespace) -> int:
     if ENV_FILE.exists():
         print(f".env already exists at {ENV_FILE} — leaving it alone.")
@@ -170,13 +239,49 @@ def cmd_init(_args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_up(_args: argparse.Namespace) -> int:
+def cmd_up(args: argparse.Namespace) -> int:
+    """Start the chassis. By default builds this repo's Dockerfile; with
+    `--image REF` (or CHASSIS_IMAGE) it runs a **prebuilt** image instead.
+
+    That seam is what keeps this repo minimal. An image that needs a build
+    toolchain, extra CLIs, or a whole research environment does not belong in
+    the base Dockerfile — build it `FROM <chassis image>` downstream and point
+    chassis at the result. Everything else (volumes, users, dispatcher, cron)
+    is unchanged, because only the image tag moved.
+
+    The resolved image id is printed, so a caller can record exactly what ran.
+    """
     if not ENV_FILE.exists():
         die("no .env — run `./chassis init` first.")
-    rc = compose(["up", "-d", "--build"]).returncode
-    if rc == 0:
-        attach_llm_container()
-    return rc
+
+    image = args.image or os.environ.get("CHASSIS_IMAGE") or ""
+    if image:
+        if not image_present(image):
+            print(f"chassis: {image} not present locally — pulling")
+            if run(["docker", "pull", image]).returncode != 0:
+                die(f"cannot pull {image}; build it locally or fix the ref")
+        # Overlay the image tag onto compose.yaml. `build:` stays in the base
+        # file but never fires: compose only builds when the tagged image is
+        # missing, and we just guaranteed it is not.
+        VAR_DIR.mkdir(parents=True, exist_ok=True)
+        IMAGE_OVERRIDE.write_text(
+            _to_yaml({"services": {"chassis": {"image": image}}}))
+        rc = compose(["-f", "compose.yaml", "-f", str(IMAGE_OVERRIDE),
+                      "up", "-d"]).returncode
+    elif args.no_build:
+        rc = compose(["up", "-d"]).returncode
+    else:
+        rc = compose(["up", "-d", "--build"]).returncode
+
+    if rc != 0:
+        return rc
+    attach_llm_container()
+
+    identity = image_identity(image or f"{NAME}-chassis")
+    print(f"chassis: image {identity['ref']} id {identity['id'] or '(unknown)'}")
+    for digest in identity["digests"]:
+        print(f"chassis: digest {digest}")
+    return 0
 
 
 def cmd_down(_args: argparse.Namespace) -> int:
@@ -191,11 +296,198 @@ def cmd_reload_cron(_args: argparse.Namespace) -> int:
     ).returncode
 
 
+# Launch a task in its own session so the whole tree — run-agent, the harness
+# CLI, anything either spawns — shares one process-group id we can signal later.
+# The session leader's pid is the pgid, so `echo $$` after setsid records it.
+DETACH_SH = r"""
+set -eu
+dir="$1"; handle="$2"; agent="$3"; task="$4"
+mkdir -p "$dir"
+printf '%s\t%s\n' "$agent" "$task" > "$dir/$handle.task"
+: > "$dir/$handle.log"
+setsid bash -c '
+  dir=$1; handle=$2; agent=$3; task=$4
+  echo $$ > "$dir/$handle.pgid"
+  rc=0
+  /usr/local/bin/run-agent "$agent" "$task" || rc=$?
+  echo "$rc" > "$dir/$handle.rc"
+' _ "$dir" "$handle" "$agent" "$task" >> "$dir/$handle.log" 2>&1 </dev/null &
+# Wait for the pgid file so the handle is signalable the moment we return.
+for _ in $(seq 1 100); do
+  [ -s "$dir/$handle.pgid" ] && break
+  sleep 0.05
+done
+"""
+
+# TERM the process group, then KILL what is left. Signalling the group (not the
+# pid) is the point: run-agent's child does the work, and a bare `kill $pid`
+# would orphan it. The container and the agent home are untouched — that is
+# what makes the next launch a genuine cold start rather than a resume.
+KILL_SH = r"""
+set -eu
+dir="$1"; want_agent="$2"; want_task="$3"; want_handle="$4"
+killed=0
+shopt -s nullglob
+for f in "$dir"/*.pgid; do
+  handle="$(basename "$f" .pgid)"
+  IFS=$'\t' read -r agent task < "$dir/$handle.task" 2>/dev/null || continue
+  if [ -n "$want_handle" ]; then
+    [ "$handle" = "$want_handle" ] || continue
+  else
+    [ "$agent" = "$want_agent" ] || continue
+    [ -z "$want_task" ] || [ "$task" = "$want_task" ] || continue
+  fi
+  pgid="$(cat "$f")"
+  if ! kill -0 -"$pgid" 2>/dev/null; then
+    echo "not running: $handle"
+    continue
+  fi
+  kill -TERM -"$pgid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    kill -0 -"$pgid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -KILL -"$pgid" 2>/dev/null || true
+  echo "killed $handle ($agent/$task, pgid $pgid)"
+  killed=$((killed + 1))
+done
+[ "$killed" -gt 0 ] || echo "(nothing to kill)"
+"""
+
+RUNS_SH = r"""
+set -eu
+dir="$1"
+shopt -s nullglob
+found=0
+for f in "$dir"/*.pgid; do
+  handle="$(basename "$f" .pgid)"
+  IFS=$'\t' read -r agent task < "$dir/$handle.task" 2>/dev/null || continue
+  pgid="$(cat "$f")"
+  if [ -f "$dir/$handle.rc" ]; then
+    state="exit $(cat "$dir/$handle.rc")"
+  elif kill -0 -"$pgid" 2>/dev/null; then
+    state="running"
+  else
+    state="killed"
+  fi
+  printf '%s\t%s/%s\t%s\n' "$handle" "$agent" "$task" "$state"
+  found=1
+done
+[ "$found" -eq 1 ] || echo "(no detached runs)"
+"""
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    cmd = ["/usr/local/bin/run-agent", args.agent]
-    if args.task:
-        cmd.append(args.task)
-    return exec_in(cmd, user="agent", interactive=args.task is None)
+    """Run an agent: interactive TUI, one-shot in the foreground, or detached.
+
+    `--detach` exists because a controlled experiment needs *start, let it work
+    for T, stop* — and cron cannot express that, while drift between two
+    containers' crontabs is a confound. It prints a run handle on stdout and
+    returns immediately; `chassis kill` takes that handle (or the agent name)
+    back. Output lands in /var/log/chassis/runs/<handle>.log, exit status in
+    the sibling <handle>.rc — both inside the logs volume, so a harvest gets
+    them and a container restart does not.
+    """
+    if not args.detach:
+        cmd = ["/usr/local/bin/run-agent", args.agent]
+        if args.task:
+            cmd.append(args.task)
+        return exec_in(cmd, user="agent", interactive=args.task is None)
+
+    if not args.task:
+        die("--detach needs a task (there is nothing to detach an interactive session from)")
+    require_container()
+    handle = f"{args.agent}-{args.task}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+    got = exec_script(DETACH_SH, RUN_DIR, handle, args.agent, args.task)
+    if got.returncode != 0:
+        sys.stderr.write(got.stderr)
+        die(f"could not launch {args.agent}/{args.task}")
+    print(handle)
+    return 0
+
+
+def cmd_kill(args: argparse.Namespace) -> int:
+    """Stop detached runs — by handle, or by agent (optionally narrowed to one
+    task). Leaves the container and the agent home intact."""
+    if not args.agent and not args.handle:
+        die("kill needs an agent name or --handle (refusing to stop every run)")
+    require_container()
+    got = exec_script(KILL_SH, RUN_DIR, args.agent or "", args.task or "",
+                      args.handle or "")
+    sys.stdout.write(got.stdout)
+    sys.stderr.write(got.stderr)
+    return got.returncode
+
+
+def cmd_runs(args: argparse.Namespace) -> int:
+    """List detached runs: handle, agent/task, and running | exit N | killed."""
+    require_container()
+    got = exec_script(RUNS_SH, RUN_DIR)
+    out = got.stdout
+    if args.agent:
+        out = "".join(line for line in out.splitlines(keepends=True)
+                      if line.split("\t")[1:2] and
+                      line.split("\t")[1].split("/")[0] == args.agent)
+        out = out or "(no detached runs)\n"
+    sys.stdout.write(out)
+    sys.stderr.write(got.stderr)
+    return got.returncode
+
+
+AGENT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def cmd_agent_add(args: argparse.Namespace) -> int:
+    """Install an agent directory from the host into the running chassis.
+
+    Agent dirs live on the agent-home volume, seeded once from the image's
+    template — so until now the only way to add one from outside was `docker
+    cp` by hand, with the uid-2000 chown that makes it usable left as an
+    exercise. This does both, validates agent.json before copying anything,
+    and re-renders cron so a task directory carrying a `cron` file is live
+    immediately.
+
+    Re-adding an existing agent overlays it (docker cp merges), which is what
+    you want when iterating on a prompt.
+    """
+    src = Path(args.dir).expanduser()
+    if not src.is_dir():
+        die(f"{src} is not a directory")
+    src = src.resolve()
+
+    manifest = src / "agent.json"
+    if not manifest.is_file():
+        die(f"{src} has no agent.json — that file is what makes a directory an agent")
+    try:
+        json.loads(manifest.read_text())
+    except ValueError as exc:
+        die(f"{manifest} is not valid JSON: {exc}")
+
+    name = args.name or src.name
+    if not AGENT_NAME_RE.fullmatch(name):
+        die(f"bad agent name {name!r}: use letters, digits, dot, dash, underscore "
+            "(and not a leading dot — the entrypoint's globs skip dotfiles)")
+
+    require_container()
+    home = agent_home()
+    dst = f"{home}/{name}"
+
+    rc = run(["docker", "exec", "-u", "root", CONTAINER,
+              "install", "-d", "-m", "755", "-o", "agent", "-g", "agent", dst]).returncode
+    if rc != 0:
+        die(f"could not create {dst} in {CONTAINER}")
+    # `<src>/.` copies the *contents*, so the destination directory we just
+    # created (with the right owner) is the one that survives.
+    rc = run(["docker", "cp", f"{src}{os.sep}.", f"{CONTAINER}:{dst}"]).returncode
+    if rc != 0:
+        die(f"docker cp of {src} failed")
+    rc = run(["docker", "exec", "-u", "root", CONTAINER,
+              "chown", "-R", "2000:2000", dst]).returncode
+    if rc != 0:
+        die(f"could not chown {dst} to the agent user")
+
+    print(f"chassis: installed agent {name!r} at {dst}")
+    return cmd_reload_cron(args)
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
@@ -467,6 +759,9 @@ HELP_EPILOG = """\
 common workflows:
   first run        chassis init && chassis up && chassis run driver
   attach driver    chassis run driver
+  prebuilt image   chassis up --image myorg/derived-chassis:sha-abc123
+  install an agent chassis agent add ./missions/counter
+  timed run        h=$(chassis run counter session --detach); sleep 600; chassis kill counter
   after tools/     chassis reload-cron
   smoke test       chassis test ping
   tool sandbox     chassis test driver
@@ -492,7 +787,15 @@ def main() -> int:
 
     # lifecycle
     sub.add_parser("init",        help="scaffold .env from .env.example (mode 600)").set_defaults(func=cmd_init)
-    sub.add_parser("up",          help="build + start the chassis container").set_defaults(func=cmd_up)
+
+    p_up = sub.add_parser("up",   help="build (or run a prebuilt image) + start the chassis container")
+    p_up.add_argument("--image", metavar="REF", default=None,
+                      help="run this prebuilt image instead of building (env: CHASSIS_IMAGE); "
+                           "pulled if it is not present locally")
+    p_up.add_argument("--no-build", action="store_true",
+                      help="start from the existing local image without rebuilding")
+    p_up.set_defaults(func=cmd_up)
+
     sub.add_parser("down",        help="stop the chassis container").set_defaults(func=cmd_down)
     sub.add_parser("status",      help="container state + cron file + recent log activity").set_defaults(func=cmd_status)
 
@@ -500,7 +803,27 @@ def main() -> int:
     p_run = sub.add_parser("run", help="run an agent (interactive if no task, one-shot otherwise)")
     p_run.add_argument("agent", help="agent name under /home/agent/")
     p_run.add_argument("task", nargs="?", default=None, help="optional task name for one-shot mode")
+    p_run.add_argument("--detach", "-d", action="store_true",
+                       help="launch the task in the background and print a run handle "
+                            "(requires a task; stop it with `chassis kill`)")
     p_run.set_defaults(func=cmd_run)
+
+    p_kill = sub.add_parser("kill", help="stop a detached run (container and agent home survive)")
+    p_kill.add_argument("agent", nargs="?", default=None, help="agent whose runs to stop")
+    p_kill.add_argument("task", nargs="?", default=None, help="narrow to one task of that agent")
+    p_kill.add_argument("--handle", default=None, help="stop exactly this run handle instead")
+    p_kill.set_defaults(func=cmd_kill)
+
+    p_runs = sub.add_parser("runs", help="list detached runs and their state")
+    p_runs.add_argument("agent", nargs="?", default=None, help="filter to one agent")
+    p_runs.set_defaults(func=cmd_runs)
+
+    p_agent = sub.add_parser("agent", help="manage agent definitions on the agent-home volume")
+    agent_sub = p_agent.add_subparsers(dest="agent_cmd", required=True, metavar="<subcommand>")
+    p_agent_add = agent_sub.add_parser("add", help="install an agent directory from the host")
+    p_agent_add.add_argument("dir", help="host directory containing agent.json (+ SYSTEM.md, task dirs)")
+    p_agent_add.add_argument("--name", default=None, help="install under this name (default: the directory's)")
+    p_agent_add.set_defaults(func=cmd_agent_add)
 
     p_shell = sub.add_parser("shell", help="open a shell in the container (default: agent user)")
     p_shell.add_argument("--root", action="store_true", help="open as root instead of agent")
